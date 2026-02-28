@@ -9,6 +9,7 @@ These utilities run operations in forked children so the parent stays clean.
 Uses pipe-based IPC for reduced overhead (no temp files, no cleanup needed).
 """
 
+import gc
 import io
 import logging
 import os
@@ -16,27 +17,73 @@ import pickle
 import resource
 import select
 import signal
+import sys
 import time
 import traceback
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Callable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from enum import auto
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from queue import Empty
 from time import process_time
 from typing import Any
 from typing import NamedTuple
+from typing import TypeVar
+from typing import cast
 
+from mutmut.configuration import ProcessIsolation
+from mutmut.configuration import config
+from mutmut.models.results import StatsResult
+from mutmut.runners.harness import ListAllTestsResult
+from mutmut.runners.harness import PytestRunner
 from mutmut.runners.harness import TestRunner
+from mutmut.state import state
+from mutmut.utils.logging_utils import get_log_file_path
+from mutmut.utils.logging_utils import get_logger
+from mutmut.utils.logging_utils import setup_file_logging
+from mutmut.utils.safe_setproctitle import safe_setproctitle as setproctitle
 from mutmut.workers.timeout import register_timeout
 
 
-def run_in_fork_with_result(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+def get_mutant_runner(max_workers: int = 1) -> "MutantRunner":
+    """Create a MutantRunner based on the configured process_isolation.
+
+    Args:
+        max_workers: Maximum number of concurrent workers.
+    Returns:
+        A MutantRunner instance (ForkRunner or HotForkRunner).
+    """
+
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1")
+
+    if config().process_isolation == ProcessIsolation.HOT_FORK:
+        return HotForkRunner(
+            max_workers=max_workers,
+            test_runner_class=PytestRunner,
+            test_runner_args={},
+            debug=config().debug,
+            max_restarts=config().max_orchestrator_restarts,
+        )
+
+    pytest_runner = PytestRunner()
+    pytest_runner.prepare_main_test_run()
+    return ForkRunner(
+        max_workers=max_workers,
+        test_runner=pytest_runner,
+        debug=config().debug,
+    )
+
+
+T = TypeVar("T")
+
+
+def run_in_fork_with_result(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """Fork a child to run a function, return its result via pipe.
 
     The parent process stays clean - child's imports don't affect parent.
@@ -44,7 +91,8 @@ def run_in_fork_with_result(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
 
     Args:
         fn: Function that returns a picklable result.
-        *args, **kwargs: Arguments to pass to fn.
+        args: Arguments to pass to fn.
+        kwargs: Kwarguments to pass to fn.
 
     Returns:
         The return value of fn(*args, **kwargs).
@@ -72,17 +120,22 @@ def run_in_fork_with_result(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
                 pass
             os._exit(1)
 
-    # Parent: close write end, wait for child, read result
+    # Parent: close write end, read result, THEN wait for child
+    # IMPORTANT: Must read BEFORE waitpid to avoid deadlock!
+    # If the pickled data exceeds pipe buffer (~64KB), child blocks on write
+    # waiting for parent to read. If parent waits on child first = deadlock.
     os.close(write_fd)
-    _, status = os.waitpid(pid, 0)
-    exit_code = os.waitstatus_to_exitcode(status)
 
-    # Read result from pipe
+    # Read result from pipe first (unblocks child's write)
     with os.fdopen(read_fd, "rb") as f:
         try:
             data = pickle.load(f)
         except Exception:
             data = None
+
+    # Now wait for child to exit
+    _, status = os.waitpid(pid, 0)
+    exit_code = os.waitstatus_to_exitcode(status)
 
     if exit_code != 0 or data is None:
         error_msg = f"Child exited with code {exit_code}"
@@ -93,7 +146,7 @@ def run_in_fork_with_result(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
     if not data.get("ok"):
         raise ChildProcessError(f"Child failed: {data.get('error', 'unknown')}")
 
-    return data["value"]
+    return cast(T, data["value"])
 
 
 def run_in_fork(fn: Callable[..., int], *args: Any, **kwargs: Any) -> int:
@@ -157,62 +210,6 @@ class OrchestratorCrashError(Exception):
         super().__init__("\n".join(details))
 
 
-logger = logging.getLogger(__name__)
-
-_file_handler: logging.Handler | None = None
-
-
-def setup_file_logging(log_file: str = "mutants/mutmut-debug.log", level: int = logging.DEBUG) -> None:
-    """Set up file-based logging for debugging.
-
-    Creates a rotating log file at the specified path. Useful for debugging
-    child processes which can't easily log to the console.
-
-    Args:
-        log_file: Path to the log file (default: 'mutants/mutmut-debug.log')
-        level: Logging level (default: DEBUG)
-    """
-    global _file_handler
-
-    if _file_handler is not None:
-        return
-
-    log_path = Path(log_file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    _file_handler = RotatingFileHandler(
-        log_path,
-        maxBytes=10 * 1024 * 1024,  # 10 MB
-        backupCount=3,
-    )
-    _file_handler.setLevel(level)
-
-    formatter = logging.Formatter(
-        "%(asctime)s.%(msecs)03d [%(process)d] %(name)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    _file_handler.setFormatter(formatter)
-
-    # Add handler to mutmut logger - file only, no stdout
-    root_logger = logging.getLogger("mutmut")
-    root_logger.addHandler(_file_handler)
-    root_logger.setLevel(level)
-    root_logger.propagate = False  # Don't propagate to root logger (avoids stdout)
-
-    logger.debug(f"File logging initialized: {log_path}")
-
-
-def get_log_file_path(log_dir: str = "mutants") -> Path:
-    """Get the path to the debug log file.
-
-    Args:
-        log_dir: Directory where log files are stored
-
-    Returns:
-        Path to the debug log file
-    """
-    return Path(log_dir) / "mutmut-debug.log"
-
-
 class MutantStatus(Enum):
     """Result status for a tested mutant."""
 
@@ -228,8 +225,6 @@ class MutantStatus(Enum):
     @classmethod
     def from_exit_code(cls, exit_code: int) -> "MutantStatus":
         """Convert an exit code to a MutantStatus.
-
-        This mapping mirrors status_by_exit_code from __main__.py.
 
         Args:
             exit_code: The exit code from the test runner.
@@ -276,6 +271,14 @@ class ActiveWorker(NamedTuple):
     estimated_time: float
 
 
+class RunningWorker(NamedTuple):
+    """Tracks a running mutation test worker for ForkRunner."""
+
+    mutant_name: str
+    start_time: datetime
+    estimated_time: float
+
+
 class MutantRunner(ABC):
     """Abstract base class for mutation test runners.
 
@@ -306,7 +309,7 @@ class MutantRunner(ABC):
     """
 
     @abstractmethod
-    def startup(self, max_children: int) -> None:
+    def startup(self) -> None:
         """Called once before mutation testing begins.
 
         Args:
@@ -377,6 +380,22 @@ class MutantRunner(ABC):
     def shutdown(self) -> None:
         """Called after all mutants tested. Clean up resources."""
 
+    @abstractmethod
+    def collect_stats(self, tests: Iterable[str] | None) -> int:
+        """Run stats collection. Returns exit code."""
+
+    @abstractmethod
+    def run_clean_tests(self, tests: Iterable[str]) -> int:
+        """Run clean tests. Returns exit code."""
+
+    @abstractmethod
+    def run_forced_fail(self) -> int:
+        """Run forced fail test. Returns exit code."""
+
+    @abstractmethod
+    def list_all_tests(self) -> ListAllTestsResult:
+        """List all tests in the test suite. Returns ListAllTestsResult."""
+
 
 class HotForkRunner(MutantRunner):
     """Fork-safe mutation runner using single hot orchestrator.
@@ -410,6 +429,7 @@ class HotForkRunner(MutantRunner):
         debug: bool = False,
         max_restarts: int | None = None,
     ):
+        self._logger = get_logger(__name__)
         self.max_workers = max_workers
         self.test_runner_class = test_runner_class
         self.test_runner_args = test_runner_args
@@ -430,13 +450,14 @@ class HotForkRunner(MutantRunner):
         self._restart_count = 0
         self._crash_exit_codes: list[int] = []
 
-    def startup(self, max_children: int | None = None) -> None:
+    def startup(self) -> None:
         """Fork the orchestrator process.
 
         Args:
             max_children: Ignored (uses self.max_workers from __init__).
                           Present for MutantRunner ABC compatibility.
         """
+        gc.freeze()
         self._start_orchestrator()
 
     def _start_orchestrator(self) -> None:
@@ -473,7 +494,7 @@ class HotForkRunner(MutantRunner):
         os.close(self.work_pipe_read)
         os.close(self.result_pipe_write)
         self.orchestrator_pid = pid
-        logger.info(f"HotForkRunner started orchestrator (pid={pid})")
+        self._logger.info(f"HotForkRunner started orchestrator (pid={pid})")
 
     def _restart_orchestrator_with_pending_work(self, exit_code: int = -1) -> None:
         """Restart orchestrator and re-submit all pending work.
@@ -490,11 +511,11 @@ class HotForkRunner(MutantRunner):
         # Log detailed crash info including pending mutants
         crash_log_path = get_log_file_path().parent / ".orchestrator-crash.log"
         pending_mutants = list(self._pending)
-        logger.error(
+        self._logger.error(
             f"Orchestrator crashed with exit code {exit_code}. "
             f"Check {crash_log_path} and {get_log_file_path()} for details."
         )
-        logger.error(f"Pending mutants at time of crash ({len(pending_mutants)}): {pending_mutants}")
+        self._logger.error(f"Pending mutants at time of crash ({len(pending_mutants)}): {pending_mutants}")
 
         if self._restart_count > self.max_restarts:
             crash_log = get_log_file_path().parent / ".orchestrator-crash.log"
@@ -503,7 +524,7 @@ class HotForkRunner(MutantRunner):
             )
 
         lost_count = len(self._pending)
-        logger.warning(
+        self._logger.warning(
             f"Orchestrator crashed, restarting (attempt {self._restart_count}/{self.max_restarts}), "
             f"re-submitting {lost_count} pending mutant(s)"
         )
@@ -522,9 +543,9 @@ class HotForkRunner(MutantRunner):
             os.write(self.work_pipe_write, data)
             # Update start time to now
             self._pending_work[mutant_name] = (tests, cpu_time_limit, estimated_time, datetime.now())
-            logger.debug(f"Re-submitted {mutant_name} to new orchestrator")
+            self._logger.debug(f"Re-submitted {mutant_name} to new orchestrator")
 
-        logger.info(f"Orchestrator restarted, {lost_count} mutant(s) re-submitted")
+        self._logger.info(f"Orchestrator restarted, {lost_count} mutant(s) re-submitted")
 
     def _write_crash_log(self, exception: Exception) -> None:
         """Write crash information for debugging.
@@ -590,15 +611,22 @@ class HotForkRunner(MutantRunner):
         # Ignore SIGINT - parent handles shutdown
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        # Set up file logging for debugging (same as subprocess workers)
         setup_file_logging()
-        orchestrator_logger = logging.getLogger("mutmut.hotfork.orchestrator")
+        orchestrator_logger = get_logger("mutmut.hotfork.orchestrator")
         orchestrator_logger.info(f"Hot-fork orchestrator starting (pid={os.getpid()})")
 
         test_runner: TestRunner = self.test_runner_class(**self.test_runner_args)
 
         # Call warm_up if available (pre-imports expensive modules)
-        test_runner.warm_up()
+        # Suppress stdout/stderr during warmup to avoid breaking terminal output
+        import sys
+
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+        try:
+            test_runner.warm_up()
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
         orchestrator_logger.info("Test runner initialized, ready for work")
 
         # Set up SIGCHLD notification pipe for efficient child reaping
@@ -635,10 +663,11 @@ class HotForkRunner(MutantRunner):
                 break
 
             mutant_name, tests, cpu_time_limit = msg
+
             # Wall-clock timeout should be shorter than CPU limit because:
-            # - Multi-threaded code can use more CPU time than wall time
+            # - Multi-threaded code can use more CPU time than wall time (N threads = N*wall_time CPU time)
             # - Wall time is actual elapsed time; CPU time is sum across cores
-            # Use half of CPU limit as wall timeout
+            # Use half of CPU limit as wall timeout (if 4 threads run for X wall time, they use ~4X CPU time)
             wall_timeout = cpu_time_limit / 2
             orchestrator_logger.debug(
                 f"Received mutant: {mutant_name} ({len(tests)} tests, cpu_limit={cpu_time_limit}s, wall_timeout={wall_timeout}s)"
@@ -648,26 +677,25 @@ class HotForkRunner(MutantRunner):
             child_pid = os.fork()
             if child_pid == 0:
                 # Grandchild: run test with CPU limit
-                worker_logger = logging.getLogger(f"mutmut.hotfork.worker.{os.getpid()}")
+                worker_logger = get_logger(f"mutmut.hotfork.worker.{os.getpid()}")
                 worker_logger.debug(f"Starting {mutant_name} ({len(tests)} tests)")
 
                 # Suppress stdout/stderr to avoid breaking terminal output
                 import sys
 
+                # # Suppress stdout/stderr to avoid breaking terminal output
                 sys.stdout = sys.stderr = open(os.devnull, "w")
 
+                # Set CPU time limit (catches runaway CPU usage)
                 limit = cpu_time_limit + int(process_time())
                 resource.setrlimit(resource.RLIMIT_CPU, (limit, limit + 1))
 
                 os.environ["MUTANT_UNDER_TEST"] = mutant_name
                 try:
                     exit_code = test_runner.run_tests(mutant_name=mutant_name, tests=tests)
-                except Exception as e:
-                    worker_logger.error(f"Exception running {mutant_name}: {e}")
+                except Exception:
                     exit_code = -1
 
-                status_name = MutantStatus.from_exit_code(exit_code).name
-                worker_logger.debug(f"Finished {mutant_name}: {status_name} (exit={exit_code})")
                 os._exit(exit_code)
 
             running[child_pid] = self.RunningChild(mutant_name, time.time(), wall_timeout)
@@ -675,7 +703,6 @@ class HotForkRunner(MutantRunner):
             register_timeout(child_pid, wall_timeout)
 
         orchestrator_logger.info("Work queue exhausted, waiting for remaining children")
-        # Wait for remaining children
         while running:
             self._reap_children(running, result_file, orchestrator_logger, sigchld_pipe_r, block=True, timeout=1.0)
 
@@ -771,7 +798,7 @@ class HotForkRunner(MutantRunner):
         try:
             os.close(self.work_pipe_write)
             self.work_pipe_write = None
-            logger.debug("Work pipe closed, orchestrator will drain remaining workers")
+            self._logger.debug("Work pipe closed, orchestrator will drain remaining workers")
         except OSError:
             self.work_pipe_write = None
 
@@ -798,15 +825,15 @@ class HotForkRunner(MutantRunner):
 
                 # Exit code 0 means clean shutdown - don't restart
                 if exit_code == 0:
-                    logger.debug(f"Orchestrator (pid={pid}) exited cleanly")
+                    self._logger.debug(f"Orchestrator (pid={pid}) exited cleanly")
                     return
 
                 # Non-zero exit code means crash - attempt restart
-                logger.warning(f"Orchestrator (pid={pid}) crashed with exit code {exit_code}")
+                self._logger.warning(f"Orchestrator (pid={pid}) crashed with exit code {exit_code}")
                 self._restart_orchestrator_with_pending_work(exit_code=exit_code)
         except ChildProcessError:
             # No child to wait for - orchestrator is gone
-            logger.warning("Orchestrator process not found")
+            self._logger.warning("Orchestrator process not found")
             self.orchestrator_pid = None
             self._restart_orchestrator_with_pending_work(exit_code=-1)
 
@@ -894,7 +921,7 @@ class HotForkRunner(MutantRunner):
             return  # Prevent re-entrant shutdown
         self._shutting_down = True
 
-        logger.info("HotForkRunner shutting down")
+        self._logger.info("HotForkRunner shutting down")
 
         # Close work pipe to signal orchestrator to finish (if not already closed)
         self.signal_work_complete()
@@ -929,4 +956,254 @@ class HotForkRunner(MutantRunner):
             except OSError:
                 pass
 
-        logger.info("HotForkRunner shutdown complete")
+        gc.unfreeze()
+        self._logger.info("HotForkRunner shutdown complete")
+
+    def collect_stats(self, tests: Iterable[str] | None) -> int:
+        """Run stats collection in a fork to keep parent clean.
+
+        The child process imports pytest, runs stats, and returns the collected
+        data via pipe. Parent updates state() with the returned data.
+
+        Args:
+            tests: Set of test names to run, or None for all tests.
+
+        Returns:
+            Exit code from stats collection (0 = success).
+        """
+
+        def _run_stats() -> dict[str, Any]:
+            # Create runner in child process to avoid importing pytest in parent
+            child_runner: TestRunner = self.test_runner_class(**self.test_runner_args)
+            exit_code = child_runner.run_stats(tests=tests)
+
+            return StatsResult(
+                exit_code=exit_code,
+                tests_by_mangled_function_name=dict(state().tests_by_mangled_function_name),
+                duration_by_test=dict(state().duration_by_test),
+                stats_time=state().stats_time,
+                function_dependencies=dict(state().function_dependencies),
+            ).to_dict()
+
+        result = StatsResult.from_dict(run_in_fork_with_result(_run_stats))
+
+        # Update parent state with child's collected data
+        for k, v in result.tests_by_mangled_function_name.items():
+            state().tests_by_mangled_function_name[k] |= v
+        state().duration_by_test.update(result.duration_by_test)
+        state().stats_time = result.stats_time
+        for k, v in result.function_dependencies.items():
+            state().function_dependencies[k] = v
+
+        return result.exit_code
+
+    def run_clean_tests(self, tests: Iterable[str]) -> int:
+        """Run clean tests in a fork to keep parent clean.
+
+        Args:
+            mutant_name: The mutant identifier.
+            tests: Set of test names to run.
+
+        Returns:
+            Exit code from test run (0 = success).
+        """
+
+        def _run_tests() -> int:
+            # Create runner in child process to avoid importing pytest in parent
+            child_runner: TestRunner = self.test_runner_class(**self.test_runner_args)
+            return child_runner.run_tests(mutant_name=None, tests=tests)
+
+        return run_in_fork(_run_tests)
+
+    def run_forced_fail(self) -> int:
+        """Run forced fail test in a fork to keep parent clean.
+
+        Returns:
+            Exit code from test run (0 = tests passed, non-zero = forced fail worked).
+        """
+
+        def _run_forced_fail() -> int:
+            # Create runner in child process to avoid importing pytest in parent
+            child_runner: TestRunner = self.test_runner_class(**self.test_runner_args)
+            return child_runner.run_forced_fail()
+
+        return run_in_fork(_run_forced_fail)
+
+    def list_all_tests(self) -> ListAllTestsResult:
+        """List all tests in a fork to keep parent clean.
+
+        Returns:
+            ListAllTestsResult containing all test IDs.
+        """
+
+        def _list_all_tests() -> dict[str, Any]:
+            # Create runner in child process to avoid importing pytest in parent
+            child_runner: TestRunner = self.test_runner_class(**self.test_runner_args)
+            result = child_runner.list_all_tests()
+            # Return as dict for pickle serialization
+            return {"ids": list(result.ids)}
+
+        data = run_in_fork_with_result(_list_all_tests)
+        return ListAllTestsResult(ids=set(data["ids"]))
+
+
+class ForkRunner(MutantRunner):
+    """Runner that uses os.fork() for process isolation.
+
+    This is the traditional mutmut approach - fast but can cause issues
+    with libraries like gevent, grpc, and torch when forking from a
+    polluted parent process.
+
+    For fork-unsafe libraries, use HotForkRunner instead.
+    """
+
+    def __init__(
+        self,
+        max_workers: int,
+        test_runner: TestRunner,
+        debug: bool = False,
+    ):
+        self.max_workers = max_workers
+        self.test_runner = test_runner
+        self.debug = debug
+        self._running: dict[int, RunningWorker] = {}  # pid -> RunningWorker
+        self._no_tests_results: list[MutantResult] = []
+
+    def startup(self) -> None:
+        """Freeze gc to avoid cache thrashing in workers.
+
+        Args:
+            max_children: Ignored (uses self.max_workers from __init__).
+                          Present for MutantRunner ABC compatibility.
+        """
+        gc.freeze()
+
+    def submit(self, mutant_name: str, tests: list[str], cpu_time_limit: int, estimated_time: float) -> None:
+        """Fork a child process to test the mutant.
+
+        Args:
+            mutant_name: The mutant identifier.
+            tests: List of test paths to run.
+            cpu_time_limit: CPU time limit in seconds.
+            estimated_time: Estimated test duration for timeout tracking.
+        """
+
+        if not tests:
+            self._no_tests_results.append(
+                MutantResult(mutant_name=mutant_name, exit_code=33, status=MutantStatus.NO_TESTS, duration=0.0)
+            )
+            return
+
+        pid = os.fork()
+        if pid == 0:
+            # In child process
+            os.environ["MUTANT_UNDER_TEST"] = mutant_name
+            setproctitle(f"mutmut: {mutant_name}")
+
+            tests_sorted = sorted(tests, key=lambda t: state().duration_by_test.get(t, 0))
+
+            # Set CPU time limit
+            limit = cpu_time_limit + int(process_time())
+            resource.setrlimit(resource.RLIMIT_CPU, (limit, limit + 1))
+
+            sys.stdout = sys.stderr = open(os.devnull, "w")
+
+            result = self.test_runner.run_tests(mutant_name=mutant_name, tests=tests_sorted)
+            os._exit(result)
+        else:
+            # In parent process
+            wall_time_limit_s = (estimated_time + 1) * 15
+            register_timeout(pid=pid, timeout_s=wall_time_limit_s)
+            self._running[pid] = RunningWorker(mutant_name, datetime.now(), estimated_time)
+
+    def has_capacity(self) -> bool:
+        """Check if we can submit more work."""
+        return len(self._running) < self.max_workers
+
+    def wait_for_result(self, timeout: float | None = None) -> MutantResult:
+        """Wait for a child process to complete.
+
+        Args:
+            timeout: Ignored for ForkRunner (os.wait blocks until a child exits).
+
+        Returns:
+            MutantResult for the completed mutant test.
+        """
+        if self._no_tests_results:
+            return self._no_tests_results.pop(0)
+
+        pid, wait_status = os.wait()
+        exit_code = os.waitstatus_to_exitcode(wait_status)
+
+        worker = self._running.pop(pid)
+        duration = (datetime.now() - worker.start_time).total_seconds()
+        status = MutantStatus.from_exit_code(exit_code)
+
+        return MutantResult(
+            mutant_name=worker.mutant_name,
+            exit_code=exit_code,
+            status=status,
+            duration=duration,
+        )
+
+    def pending_count(self) -> int:
+        """Number of child processes currently running."""
+        return len(self._running)
+
+    def get_active_workers(self) -> list[ActiveWorker]:
+        """Return active workers for timeout checking."""
+        return [ActiveWorker(pid, w.start_time, w.mutant_name, w.estimated_time) for pid, w in self._running.items()]
+
+    def signal_work_complete(self) -> None:
+        """No-op for ForkRunner (no orchestrator to signal)."""
+
+    def get_orchestrator_restart_count(self) -> int:
+        """ForkRunner has no orchestrator."""
+        return 0
+
+    def shutdown(self) -> None:
+        """Wait for all remaining children."""
+        while self._running:
+            try:
+                self.wait_for_result()
+            except ChildProcessError:
+                break
+        gc.unfreeze()
+
+    def collect_stats(self, tests: Iterable[str] | None) -> int:
+        """Run stats collection directly (no fork needed - already in clean process).
+
+        Args:
+            tests: Set of test names to run, or None for all tests.
+
+        Returns:
+            Exit code from stats collection (0 = success).
+        """
+        return self.test_runner.run_stats(tests=tests)
+
+    def run_clean_tests(self, tests: Iterable[str]) -> int:
+        """Run clean tests directly.
+
+        Args:
+            tests: Set of test names to run.
+
+        Returns:
+            Exit code from test run (0 = success).
+        """
+        return self.test_runner.run_tests(mutant_name=None, tests=tests)
+
+    def run_forced_fail(self) -> int:
+        """Run forced fail test directly.
+
+        Returns:
+            Exit code from test run (0 = tests passed, non-zero = forced fail worked).
+        """
+        return self.test_runner.run_forced_fail()
+
+    def list_all_tests(self) -> ListAllTestsResult:
+        """List all tests in the test suite.
+
+        Returns:
+            ListAllTestsResult containing all test IDs.
+        """
+        return self.test_runner.list_all_tests()

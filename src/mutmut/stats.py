@@ -5,8 +5,8 @@ This module contains the Stat dataclass and functions for collecting
 and printing mutation testing statistics.
 """
 
+import json
 from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from mutmut.models.source_file_mutation_data import SourceFileMutationData
@@ -18,6 +18,8 @@ from mutmut.models.summary import SummaryStats
 from mutmut.models.summary import SurvivingMutant
 from mutmut.state import state
 from mutmut.ui.terminal import print_status
+from mutmut.utils.format_utils import mangled_name_from_mutant_name
+from mutmut.utils.format_utils import orig_function_and_class_names_from_key
 
 status_by_exit_code = defaultdict(
     lambda: "suspicious",
@@ -181,13 +183,28 @@ def calculate_stats_by_mutation_type(
     return {mutation_type: dict(status_counts) for mutation_type, status_counts in stats_by_type.items()}
 
 
+def save_stats() -> None:
+    with open("mutants/mutmut-stats.json", "w") as f:
+        json.dump(
+            {
+                "tests_by_mangled_function_name": {
+                    k: list(v) for k, v in state().tests_by_mangled_function_name.items()
+                },
+                "duration_by_test": state().duration_by_test,
+                "stats_time": state().stats_time,
+                "function_hashes": state().current_function_hashes,
+                "function_dependencies": {k: list(v) for k, v in state().function_dependencies.items()},
+            },
+            f,
+            indent=4,
+        )
+
+
 def write_summary_file(
     source_file_mutation_data_by_path: dict[str, SourceFileMutationData],
     stats: Stat,
     duration: float,
     count_unchanged: int,
-    mangled_name_from_mutant_name: Callable[[str], str],
-    orig_function_and_class_names_from_key: Callable[[str], tuple[str, str | None]],
 ) -> None:
     """Write a summary.json file for programmatic access to mutation testing results.
 
@@ -199,8 +216,6 @@ def write_summary_file(
         stats: Stats object with aggregated statistics.
         duration: Total duration of the run in seconds.
         count_unchanged: Number of mutants skipped because they had results from previous runs.
-        mangled_name_from_mutant_name: Function to convert mutant name to mangled name.
-        orig_function_and_class_names_from_key: Function to extract function/class names from key.
     """
     surviving: list[SurvivingMutant] = []
     not_checked: list[NotCheckedMutant] = []

@@ -17,6 +17,7 @@ from pathlib import Path
 from mutmut.configuration import HotForkWarmup
 from mutmut.configuration import config
 from mutmut.state import state
+from mutmut.stats import save_stats
 
 
 class CollectTestsFailedException(Exception):
@@ -68,8 +69,6 @@ class ListAllTestsResult:
 
     def clear_out_obsolete_test_names(self) -> None:
         """Remove test names that are no longer in the test suite."""
-        # Import here to avoid circular dependency
-        from mutmut.__main__ import save_stats
 
         count_before = sum(len(x) for x in state().tests_by_mangled_function_name)
         state().tests_by_mangled_function_name = defaultdict(
@@ -167,12 +166,11 @@ class PytestRunner(TestRunner):
         warmup = config().hot_fork_warmup
 
         if warmup == HotForkWarmup.COLLECT:
-            # Run pytest --collect-only to pre-load test infrastructure
-            import pytest
-
+            # Full test collection - loads conftest.py, plugins, test modules
+            # Suppress stdout completely during warmup collection
             with change_cwd("mutants"):
-                pytest.main(
-                    ["--collect-only", "-q", "--rootdir=."] + self._pytest_add_cli_args_test_selection,
+                self.execute_pytest(
+                    ["--collect-only", "-qqq", "--rootdir=."] + self._pytest_add_cli_args_test_selection,
                 )
         elif warmup == HotForkWarmup.IMPORT:
             # Import modules from preload file
@@ -188,17 +186,14 @@ class PytestRunner(TestRunner):
                                 importlib.import_module(module_name)
                             except ImportError:
                                 pass  # Best effort
-        else:
-            # warmup == HotForkWarmup.NONE - just import pytest (required to run tests
-            # in a forked process)
-            import pytest  # noqa: F401
+        # warmup == HotForkWarmup.NONE - noop
 
     # noinspection PyMethodMayBeStatic
     def execute_pytest(self, params: list[str], **kwargs: object) -> int:
         """Execute pytest with the given parameters."""
-        import pytest
+        import pytest  # noqa: F401
 
-        params = ["--rootdir=.", "--tb=native"] + params + self._pytest_add_cli_args
+        params = ["--rootdir=.", "-q", "--tb=native"] + params + self._pytest_add_cli_args
         if config().debug:
             params = ["-vv"] + params
             print("python -m pytest ", " ".join([f'"{param}"' for param in params]))
@@ -245,6 +240,7 @@ class PytestRunner(TestRunner):
             pytest_args += list(tests)
         else:
             pytest_args += self._pytest_add_cli_args_test_selection
+
         with change_cwd("mutants"):
             return int(self.execute_pytest(pytest_args))
 
