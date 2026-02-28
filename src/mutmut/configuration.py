@@ -8,10 +8,36 @@ from configparser import ConfigParser
 from configparser import NoOptionError
 from configparser import NoSectionError
 from dataclasses import dataclass
+from enum import Enum
 from os.path import isdir
 from os.path import isfile
 from pathlib import Path
 from typing import Any
+
+
+class ProcessIsolation(str, Enum):
+    """Valid values for process_isolation config.
+
+    Using str, Enum allows direct string comparison while providing
+    validation and IDE support.
+    """
+
+    FORK = "fork"  # Default: current behavior
+    HOT_FORK = "hot-fork"  # Fork-safe for gevent/grpc
+
+
+class HotForkWarmup(str, Enum):
+    """Warmup strategies for hot-fork orchestrator.
+
+    Controls what the orchestrator does before forking grandchildren:
+    - COLLECT: Run pytest --collect-only to pre-load test infrastructure (DEFAULT)
+    - IMPORT: Import modules from a file (useful when test collection has side effects)
+    - NONE: Just import pytest, no test collection
+    """
+
+    COLLECT = "collect"  # Default: ~5.5x speedup from pre-loaded tests
+    IMPORT = "import"
+    NONE = "none"
 
 
 def _config_reader() -> Callable[[str, Any], Any]:
@@ -92,6 +118,22 @@ def _guess_paths_to_mutate() -> list[str]:
 def _load_config() -> Config:
     s = _config_reader()
 
+    # Validate process_isolation (default: fork - preserves current behavior)
+    isolation_str = s("process_isolation", "fork")
+    try:
+        process_isolation = ProcessIsolation(isolation_str)
+    except ValueError:
+        valid = [e.value for e in ProcessIsolation]
+        raise ValueError(f"Invalid process_isolation value: {isolation_str!r}. Expected one of: {valid}") from None
+
+    # Validate hot_fork_warmup (default: collect)
+    warmup_str = s("hot_fork_warmup", "collect")
+    try:
+        hot_fork_warmup = HotForkWarmup(warmup_str)
+    except ValueError:
+        valid = [e.value for e in HotForkWarmup]
+        raise ValueError(f"Invalid hot_fork_warmup value: {warmup_str!r}. Expected one of: {valid}") from None
+
     return Config(
         do_not_mutate=s("do_not_mutate", []),
         also_copy=[Path(y) for y in s("also_copy", [])]
@@ -112,6 +154,10 @@ def _load_config() -> Config:
         type_check_command=s("type_check_command", []),
         track_dependencies=s("track_dependencies", True),
         dependency_tracking_depth=s("dependency_tracking_depth", None),
+        process_isolation=process_isolation,
+        max_orchestrator_restarts=s("max_orchestrator_restarts", 3),
+        hot_fork_warmup=hot_fork_warmup,
+        preload_modules_file=s("preload_modules_file", None),
     )
 
 
@@ -129,6 +175,10 @@ class Config:
     type_check_command: list[str]
     track_dependencies: bool
     dependency_tracking_depth: int | None
+    process_isolation: ProcessIsolation  # Default: FORK (preserves current behavior)
+    max_orchestrator_restarts: int  # Default: 3
+    hot_fork_warmup: HotForkWarmup  # Default: COLLECT
+    preload_modules_file: str | None  # Default: None (for IMPORT warmup)
 
     def should_ignore_for_mutation(self, path: Path | str) -> bool:
         path_str = str(path)
