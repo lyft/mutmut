@@ -13,7 +13,7 @@ def get_len_clone(data: Collection): pass  # pragma: no mutate
 
 
 # verify that mutmut can handle annotations that area
-def get_foo_len(data: Foo) -> int:
+def get_foo_len(data: Foo) -> int:  # noqa: F821
     return len(data.foo) + 0
 
 def get_foo_len_clone(data: Foo) -> int: pass  # pragma: no mutate

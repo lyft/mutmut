@@ -1,4 +1,4 @@
-from type_checking import *
+from type_checking import hello, a_hello_wrapper, mutate_me
 
 def test_hello():
     assert hello() == "Hello from type-checking!"

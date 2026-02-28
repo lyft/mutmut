@@ -19,8 +19,10 @@ def badly_tested() -> str:
 def untested() -> str:
     return "Mutants for this method should survive"
 
+
 def skip_this_function() -> int:  # pragma: no mutate: function
     return 1 + 2 * 3
+
 
 def also_skip_this_function() -> str:  # pragma: no mutate function
     return "should" + " not" + " mutate"

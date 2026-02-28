@@ -5,13 +5,11 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING
 
-import coverage
+from coverage import Coverage
 from coverage import CoverageData
 
-if TYPE_CHECKING:
-    from mutmut.__main__ import TestRunner
+from mutmut.runners.harness import TestRunner
 
 
 def get_covered_lines_for_file(filename: str, covered_lines: dict[str, set[int]]) -> set[int] | None:
@@ -42,7 +40,7 @@ def gather_coverage(runner: TestRunner, source_files: Iterable[Path]) -> dict[st
     mutants_path = Path("mutants")
 
     # Run the tests and gather coverage
-    cov = coverage.Coverage(source=[str(mutants_path.absolute())], data_file=None)
+    cov = Coverage(source=[str(mutants_path.absolute())], data_file=None)
     with cov.collect():
         runner.prepare_main_test_run()
         runner.run_tests(mutant_name=None, tests=[])
