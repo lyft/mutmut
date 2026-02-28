@@ -115,9 +115,6 @@ def _load_config() -> Config:
     )
 
 
-_config: Config | None = None
-
-
 @dataclass
 class Config:
     also_copy: list[Path]
@@ -142,20 +139,19 @@ class Config:
                 return True
         return False
 
-    @staticmethod
-    def ensure_loaded() -> None:
-        global _config
-        if _config is None:
-            _config = _load_config()
 
-    @staticmethod
-    def get() -> Config:
-        global _config
-        Config.ensure_loaded()
-        assert _config is not None
-        return _config
+_config: Config | None = None
 
-    @staticmethod
-    def reset() -> None:
-        global _config
-        _config = None
+
+def config() -> Config:
+    """Get the global configuration singleton, creating it if needed."""
+    global _config
+    if _config is None:
+        _config = _load_config()
+    return _config
+
+
+def reset_config() -> None:
+    """Reset the global configuration. Primarily used for testing."""
+    global _config
+    _config = None

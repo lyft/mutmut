@@ -17,7 +17,7 @@ import libcst.matchers as m
 from libcst.metadata import MetadataWrapper
 from libcst.metadata import PositionProvider
 
-from mutmut.configuration import Config
+from mutmut.configuration import config
 from mutmut.mutation.enum_mutation import is_enum_class
 from mutmut.mutation.mutators import MUTATION_OPERATORS
 from mutmut.mutation.mutators import OPERATOR_TO_TYPE
@@ -838,7 +838,7 @@ def group_by_path(errors: list[TypeCheckingError]) -> dict[Path, list[TypeChecki
 
 def filter_mutants_with_type_checker() -> dict[str, FailedTypeCheckMutant]:
     with change_cwd(Path("mutants")):
-        errors = run_type_checker(Config.get().type_check_command)
+        errors = run_type_checker(config().type_check_command)
         errors_by_path = group_by_path(errors)
 
         mutants_to_skip: dict[str, FailedTypeCheckMutant] = {}
@@ -846,6 +846,7 @@ def filter_mutants_with_type_checker() -> dict[str, FailedTypeCheckMutant]:
         for path, errors_of_file in errors_by_path.items():
             with open(path, encoding="utf-8") as file:
                 source = file.read()
+            source_lines = source.splitlines()
             wrapper = cst.MetadataWrapper(cst.parse_module(source))
             visitor = MutatedMethodsCollector(path)
             wrapper.visit(visitor)
@@ -853,14 +854,15 @@ def filter_mutants_with_type_checker() -> dict[str, FailedTypeCheckMutant]:
 
             for error in errors_of_file:
                 assert error.file_path == visitor.file
+
+                error_line = source_lines[error.line_number - 1] if error.line_number <= len(source_lines) else ""
+                if GENERATED_MARKER in error_line:
+                    continue
+
                 mutant = next(
                     (m for m in mutated_methods if m.line_number_start <= error.line_number <= m.line_number_end), None
                 )
                 if mutant is None:
-                    source_lines = source.splitlines()
-                    error_line = source_lines[error.line_number - 1] if error.line_number <= len(source_lines) else ""
-                    if GENERATED_MARKER in error_line:
-                        continue
                     raise Exception(
                         f"Could not find mutant for type error {error.file_path}:{error.line_number} ({error.error_description}). "
                         "Probably, a code mutation influenced types in unexpected locations. "
