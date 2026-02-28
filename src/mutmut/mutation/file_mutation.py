@@ -1,6 +1,9 @@
 """This module contains code for managing mutant creation for whole files."""
 
+import ast
+import hashlib
 from collections import defaultdict
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -16,6 +19,11 @@ from libcst.metadata import PositionProvider
 
 from mutmut.configuration import Config
 from mutmut.mutation.enum_mutation import is_enum_class
+from mutmut.mutation.mutators import get_method_type
+from mutmut.mutation.mutators import MethodType
+from mutmut.mutation.mutators import MUTATION_OPERATORS
+from mutmut.mutation.mutators import operator_swap_op
+from mutmut.mutation.mutators import OPERATOR_TO_TYPE
 from mutmut.mutation.mutators import OPERATORS_TYPE
 from mutmut.mutation.mutators import MethodType
 from mutmut.mutation.mutators import get_method_type
@@ -37,32 +45,113 @@ NEVER_MUTATE_FUNCTION_CALLS = {"len", "isinstance"}
 
 
 @dataclass
+class MutationMetadata:
+    line_number: int
+    mutation_type: str
+    description: str
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "line_number": self.line_number,
+            "mutation_type": self.mutation_type,
+            "description": self.description,
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, int | str]) -> "MutationMetadata":
+        return MutationMetadata(
+            line_number=int(data["line_number"]),
+            mutation_type=str(data["mutation_type"]),
+            description=str(data["description"]),
+        )
+
+
+@dataclass
 class Mutation:
     original_node: cst.CSTNode
     mutated_node: cst.CSTNode
     contained_by_top_level_function: cst.FunctionDef | None
+    line_number: int = 0
+    mutation_type: str = "unknown"
+    description: str = ""
+
+    @property
+    def metadata(self) -> "MutationMetadata":
+        return MutationMetadata(
+            line_number=self.line_number,
+            mutation_type=self.mutation_type,
+            description=self.description,
+        )
+
+
+def _compute_function_hashes(module: cst.Module, mutations: Sequence["Mutation"]) -> dict[str, str]:
+    """Compute a hash for each function that has mutations.
+
+    The hash is based on the function's AST (abstract syntax tree), so it ignores
+    whitespace and comments. If the function's logic changes, the hash will change
+    and mutmut knows to re-test all mutants for that function.
+
+    :param module: The parsed module
+    :param mutations: List of mutations (used to identify which functions were mutated)
+    :return: Dict mapping function name to its hash
+    """
+    hash_by_function_name: dict[str, str] = {}
+
+    # Get unique functions that have mutations (only FunctionDef nodes)
+    mutated_functions: set[cst.FunctionDef] = set()
+    for mutation in mutations:
+        if mutation.contained_by_top_level_function and isinstance(
+            mutation.contained_by_top_level_function, cst.FunctionDef
+        ):
+            mutated_functions.add(mutation.contained_by_top_level_function)
+
+    # Find class names for methods
+    class_by_method: dict[cst.FunctionDef, str] = {}
+    for statement in module.body:
+        if isinstance(statement, cst.ClassDef) and isinstance(statement.body, cst.IndentedBlock):
+            for item in statement.body.body:
+                if isinstance(item, cst.FunctionDef):
+                    class_by_method[item] = statement.name.value
+
+    # Compute hash for each mutated function using AST normalization
+    # This ignores whitespace and comments, making the hash stable across formatting changes
+    for func in mutated_functions:
+        func_code = cst.Module([func]).code
+        # Parse to AST and dump without field annotations for a normalized representation
+        tree = ast.parse(func_code)
+        normalized = ast.dump(tree, annotate_fields=False)
+        func_hash = hashlib.sha256(normalized.encode()).hexdigest()[:12]
+
+        func_name = func.name.value
+        class_name = class_by_method.get(func)
+        key = mangle_function_name(name=func_name, class_name=class_name)
+
+        hash_by_function_name[key] = func_hash
+
+    return hash_by_function_name
 
 
 def mutate_file_contents(
-    filename: str, code: str, covered_lines: set[int] | None = None, mutate_enums: bool = True
-) -> tuple[str, Sequence[str]]:
+    code: str, covered_lines: set[int] | None = None, mutate_enums: bool = True
+) -> tuple[str, Sequence[str], dict[str, str], dict[str, MutationMetadata]]:
     """Create mutations for `code` and merge them to a single mutated file with trampolines.
 
     :param mutate_enums: If True, enum classes will be mutated using external injection pattern.
                          If False, enum classes will be left unchanged.
-    :return: A tuple of (mutated code, list of mutant function names)"""
-    module, mutations, ignored_classes, ignored_functions = create_mutations(code, covered_lines)
+    :return: A tuple of (mutated code, list of mutant function names, hash by function name, metadata_by_name)
+    """
+    module, mutations, ignored_classes, ignored_functions = _create_mutations(code, covered_lines)
 
-    mutated_code, mutant_names = combine_mutations_to_source(
+    mutated_code, mutant_names, metadata_by_name = _combine_mutations_to_source(
         module, mutations, ignored_classes, ignored_functions, mutate_enums=mutate_enums
     )
 
-    # TODO: implement function hashing to skip testing unchanged functions
+    hash_by_function_name = _compute_function_hashes(module, mutations)
 
-    return mutated_code, mutant_names
+    return mutated_code, mutant_names, hash_by_function_name, metadata_by_name
 
 
-def create_mutations(
+def _create_mutations(
     code: str, covered_lines: set[int] | None = None
 ) -> tuple[cst.Module, list[Mutation], set[str], set[str]]:
     """Parse the code and create mutations.
@@ -74,7 +163,7 @@ def create_mutations(
 
     metadata_wrapper = MetadataWrapper(module)
     visitor = MutationVisitor(
-        mutation_operators, ignored_lines, covered_lines, ignored_class_lines, ignored_function_lines
+        MUTATION_OPERATORS, ignored_lines, covered_lines, ignored_class_lines, ignored_function_lines
     )
     module = metadata_wrapper.visit(visitor)
 
@@ -115,7 +204,7 @@ class OuterFunctionProvider(cst.BatchableMetadataProvider[cst.CSTNode | None]):
 class OuterFunctionVisitor(cst.CSTVisitor):
     """Mark all nodes as children of `top_level_node`."""
 
-    def __init__(self, provider: "OuterFunctionProvider", top_level_node: cst.CSTNode) -> None:
+    def __init__(self, provider: OuterFunctionProvider, top_level_node: cst.CSTNode) -> None:
         self.provider = provider
         self.top_level_node = top_level_node
         super().__init__()
@@ -161,13 +250,21 @@ class MutationVisitor(cst.CSTVisitor):
         return True
 
     def _create_mutations(self, node: cst.CSTNode) -> None:
+        position = self.get_metadata(PositionProvider, node, None)
+        line_number = position.start.line if position else 0
+
         for t, operator in self._operators:
             if isinstance(node, t):
+                mutation_type = _determine_mutation_type(operator, node)
                 for mutated_node in operator(node):
+                    description = _describe_mutation(node, mutated_node, mutation_type)
                     mutation = Mutation(
                         original_node=node,
                         mutated_node=mutated_node,
                         contained_by_top_level_function=self.get_metadata(OuterFunctionProvider, node, None),  # type: ignore
+                        line_number=line_number,
+                        mutation_type=mutation_type,
+                        description=description,
                     )
                     self.mutations.append(mutation)
 
@@ -247,13 +344,39 @@ trampoline_impl_cst = list(cst.parse_module(trampoline_impl).body)
 trampoline_impl_cst[-1] = trampoline_impl_cst[-1].with_changes(leading_lines=[cst.EmptyLine(), cst.EmptyLine()])
 
 
-def combine_mutations_to_source(
+def _determine_mutation_type(operator: Callable[[Any], Iterable[cst.CSTNode]], node: cst.CSTNode) -> str:
+    """Determine the mutation type from the operator function and node."""
+    base_type = OPERATOR_TO_TYPE.get(operator, "unknown")
+
+    # Disambiguate operator_swap_op based on node type
+    if operator == operator_swap_op:
+        if isinstance(node, cst.Comparison | cst.ComparisonTarget):
+            return "comparison"
+        elif isinstance(node, cst.BooleanOperation):
+            return "boolean"
+        # For arithmetic/bitwise operators, fall through to return base_type ('operator')
+
+    return base_type
+
+
+def _describe_mutation(original: cst.CSTNode, mutated: cst.CSTNode, mutation_type: str) -> str:
+    """Generate a human-readable description of what changed."""
+    orig_code = cst.Module(body=[]).code_for_node(original).strip()
+    mut_code = cst.Module(body=[]).code_for_node(mutated).strip()
+
+    if mutation_type == "statement":
+        return f"Removed `{orig_code}`"
+    else:
+        return f"Changed `{orig_code}` to `{mut_code}`"
+
+
+def _combine_mutations_to_source(
     module: cst.Module,
     mutations: Sequence[Mutation],
     ignored_classes: set[str] | None = None,
     ignored_functions: set[str] | None = None,
     mutate_enums: bool = True,
-) -> tuple[str, Sequence[str]]:
+) -> tuple[str, Sequence[str], dict[str, MutationMetadata]]:
     """Create mutated functions and trampolines for all mutations and compile them to a single source code.
 
     :param module: The original parsed module
@@ -261,13 +384,15 @@ def combine_mutations_to_source(
     :param ignored_classes: Class names to skip transformation for (e.g., enums with pragma: no mutate class)
     :param ignored_functions: Function names to skip transformation for (pragma: no mutate function)
     :param mutate_enums: Whether to mutate enum classes (True) or skip them entirely (False)
-    :return: Mutated code and list of mutation names"""
+
+    :return: Tuple of (mutated code, list of mutation names, metadata_by_name)"""
     ignored_classes = ignored_classes or set()
     ignored_functions = ignored_functions or set()
 
     # copy start of the module (in particular __future__ imports)
-    result: list[MODULE_STATEMENT] = get_statements_until_func_or_class(module.body)
+    result: list[MODULE_STATEMENT] = _get_statements_until_func_or_class(module.body)
     mutation_names: list[str] = []
+    metadata_by_name: dict[str, MutationMetadata] = {}
 
     # statements we still need to potentially mutate and add to the result
     remaining_statements = module.body[len(result) :]
@@ -275,7 +400,7 @@ def combine_mutations_to_source(
     # trampoline functions
     result.extend(trampoline_impl_cst)
 
-    mutations_within_function = group_by_top_level_node(mutations)
+    mutations_within_function = _group_by_top_level_node(mutations)
 
     # We now iterate through all top-level nodes.
     # If they are a function or class method, we mutate and add trampolines.
@@ -291,9 +416,10 @@ def combine_mutations_to_source(
             if not func_mutants:
                 result.append(func)
                 continue
-            nodes, mutant_names = function_trampoline_arrangement(func, func_mutants, class_name=None)
+            nodes, mutant_names, func_metadata = _function_trampoline_arrangement(func, func_mutants, class_name=None)
             result.extend(nodes)
             mutation_names.extend(mutant_names)
+            metadata_by_name.update(func_metadata)
         elif isinstance(statement, cst.ClassDef):
             cls = statement
             # Skip entire class if it has pragma: no mutate class
@@ -307,12 +433,13 @@ def combine_mutations_to_source(
                 if not mutate_enums:
                     result.append(cls)
                     continue
-                external_nodes, modified_cls, enum_mutant_names = enum_trampoline_arrangement(
+                external_nodes, modified_cls, enum_mutant_names, enum_metadata = _enum_trampoline_arrangement(
                     cls, mutations_within_function
                 )
                 result.extend(external_nodes)
                 result.append(modified_cls)
                 mutation_names.extend(enum_mutant_names)
+                metadata_by_name.update(enum_metadata)
             else:
                 external_nodes_for_class: list[MODULE_STATEMENT] = []
                 mutated_body = []
@@ -324,18 +451,20 @@ def combine_mutations_to_source(
 
                     method_type = get_method_type(method)
                     if method_type in (MethodType.STATICMETHOD, MethodType.CLASSMETHOD):
-                        ext_nodes, assignment, method_mutant_names = _external_method_injection(
+                        ext_nodes, assignment, method_mutant_names, method_metadata = _external_method_injection(
                             method, method_mutants, cls.name.value, method_type
                         )
                         external_nodes_for_class.extend(ext_nodes)
                         mutated_body.append(assignment)
                         mutation_names.extend(method_mutant_names)
+                        metadata_by_name.update(method_metadata)
                     else:
-                        nodes, mutant_names = function_trampoline_arrangement(
+                        nodes, mutant_names, method_metadata = _function_trampoline_arrangement(
                             method, method_mutants, class_name=cls.name.value
                         )
                         mutated_body.extend(nodes)
                         mutation_names.extend(mutant_names)
+                        metadata_by_name.update(method_metadata)
 
                 result.extend(external_nodes_for_class)
                 result.append(cls.with_changes(body=cls.body.with_changes(body=mutated_body)))
@@ -343,12 +472,22 @@ def combine_mutations_to_source(
             result.append(statement)
 
     mutated_module = module.with_changes(body=result)
-    return mutated_module.code, mutation_names
+    # Strip trailing whitespace from each line
+    code = "\n".join(line.rstrip() for line in mutated_module.code.split("\n"))
+    return code, mutation_names, metadata_by_name
 
 
 def _external_method_injection(
-    method: cst.FunctionDef, mutants: Sequence[Mutation], class_name: str, method_type: MethodType
-) -> tuple[Sequence[MODULE_STATEMENT], cst.SimpleStatementLine, Sequence[str]]:
+    method: cst.FunctionDef,
+    mutants: Sequence[Mutation],
+    class_name: str,
+    method_type: MethodType,
+) -> tuple[
+    Sequence[MODULE_STATEMENT],
+    cst.SimpleStatementLine | cst.BaseCompoundStatement,
+    Sequence[str],
+    dict[str, MutationMetadata],
+]:
     """Create external trampoline for a method using external injection pattern.
 
     This moves mutation code outside the class and uses a simple assignment
@@ -358,10 +497,11 @@ def _external_method_injection(
     :param mutants: The mutations for this method
     :param class_name: The containing class name
     :param method_type: MethodType.STATICMETHOD, MethodType.CLASSMETHOD, or MethodType.INSTANCE
-    :return: A tuple of (external_nodes, class_body_assignment, mutant_names)
+    :return: A tuple of (external_nodes, class_body_assignment, mutant_names, metadata_by_name)
     """
     external_nodes: list[MODULE_STATEMENT] = []
     mutant_names: list[str] = []
+    metadata_by_name: dict[str, MutationMetadata] = {}
     method_name = method.name.value
     prefix = f"_{class_name}_{method_name}"
     mangled_name = mangle_function_name(name=method_name, class_name=class_name) + "__mutmut"
@@ -373,9 +513,10 @@ def _external_method_injection(
         mutant_func_name = f"{prefix}_mutant_{i + 1}"
         full_mutant_name = f"{mangled_name}_{i + 1}"
         mutant_names.append(full_mutant_name)
+        metadata_by_name[full_mutant_name] = mutant.metadata
 
         mutated = method.with_changes(name=cst.Name(mutant_func_name), decorators=[])
-        mutated = cast(cst.FunctionDef, deep_replace(mutated, mutant.original_node, mutant.mutated_node))
+        mutated = _deep_replace(mutated, mutant.original_node, mutant.mutated_node)  # type: ignore[assignment]
         external_nodes.append(mutated)
     trampoline_code = build_enum_trampoline(
         class_name=class_name, method_name=method_name, mutant_names=mutant_names, method_type=method_type
@@ -390,19 +531,20 @@ def _external_method_injection(
     else:
         assignment_code = f"{method_name} = {prefix}_trampoline"
 
-    assignment = cast(cst.SimpleStatementLine, cst.parse_statement(assignment_code))
+    assignment = cst.parse_statement(assignment_code)
 
-    return external_nodes, assignment, mutant_names
+    return external_nodes, assignment, mutant_names, metadata_by_name
 
 
-def function_trampoline_arrangement(
+def _function_trampoline_arrangement(
     function: cst.FunctionDef, mutants: Iterable[Mutation], class_name: str | None
-) -> tuple[Sequence[MODULE_STATEMENT], Sequence[str]]:
+) -> tuple[Sequence[MODULE_STATEMENT], Sequence[str], dict[str, MutationMetadata]]:
     """Create mutated functions and a trampoline that switches between original and mutated versions.
 
-    :return: A tuple of (nodes, mutant names)"""
+    :return: A tuple of (nodes, mutant names, metadata_by_name)"""
     nodes: list[MODULE_STATEMENT] = []
     mutant_names: list[str] = []
+    metadata_by_name: dict[str, MutationMetadata] = {}
 
     name = function.name.value
     mangled_name = mangle_function_name(name=name, class_name=class_name) + "__mutmut"
@@ -418,8 +560,10 @@ def function_trampoline_arrangement(
     for i, mutant in enumerate(mutants):
         mutant_name = f"{mangled_name}_{i + 1}"
         mutant_names.append(mutant_name)
+        metadata_by_name[mutant_name] = mutant.metadata
+
         mutated_method = function.with_changes(name=cst.Name(mutant_name))
-        mutated_method = cast(cst.FunctionDef, deep_replace(mutated_method, mutant.original_node, mutant.mutated_node))
+        mutated_method = _deep_replace(mutated_method, mutant.original_node, mutant.mutated_node)  # type: ignore[assignment]
         nodes.append(mutated_method)
 
     # trampoline that forwards the calls
@@ -439,7 +583,7 @@ def function_trampoline_arrangement(
 
     nodes.extend(trampoline)
 
-    return nodes, mutant_names
+    return nodes, mutant_names, metadata_by_name
 
 
 def create_trampoline_wrapper(function: cst.FunctionDef, mangled_name: str, class_name: str | None) -> cst.FunctionDef:
@@ -504,7 +648,6 @@ def create_trampoline_wrapper(function: cst.FunctionDef, mangled_name: str, clas
 
     type_ignore_whitespace = cst.TrailingWhitespace(comment=cst.Comment("# type: ignore"))
 
-    function.whitespace_after_type_parameters
     return function.with_changes(
         body=cst.IndentedBlock(
             [
@@ -516,9 +659,9 @@ def create_trampoline_wrapper(function: cst.FunctionDef, mangled_name: str, clas
     )
 
 
-def enum_trampoline_arrangement(
+def _enum_trampoline_arrangement(
     cls: cst.ClassDef, mutations_by_method: Mapping[cst.CSTNode, Sequence[Mutation]]
-) -> tuple[Sequence[MODULE_STATEMENT], cst.ClassDef, Sequence[str]]:
+) -> tuple[Sequence[MODULE_STATEMENT], cst.ClassDef, Sequence[str], dict[str, MutationMetadata]]:
     """Create external functions and minimal enum class for enum mutation.
 
     This pattern moves all mutation-related code OUTSIDE the enum class body,
@@ -527,10 +670,11 @@ def enum_trampoline_arrangement(
 
     :param cls: The enum class definition
     :param mutations_by_method: Mapping of method nodes to their mutations
-    :return: A tuple of (external_nodes, modified_class, mutant_names)
+    :return: A tuple of (external_nodes, modified_class, mutant_names, metadata_by_name)
     """
     external_nodes: list[MODULE_STATEMENT] = []
     mutant_names: list[str] = []
+    metadata_by_name: dict[str, MutationMetadata] = {}
     new_body: list[cst.BaseStatement | cst.BaseSmallStatement] = []
     class_name = cls.name.value
 
@@ -551,19 +695,20 @@ def enum_trampoline_arrangement(
             new_body.append(method)
             continue
 
-        ext_nodes, assignment, method_mutant_names = _external_method_injection(
+        ext_nodes, assignment, method_mutant_names, method_metadata = _external_method_injection(
             method, method_mutants, class_name, method_type
         )
         external_nodes.extend(ext_nodes)
         new_body.append(assignment)
         mutant_names.extend(method_mutant_names)
+        metadata_by_name.update(method_metadata)
 
     modified_cls = cls.with_changes(body=cls.body.with_changes(body=new_body))
 
-    return external_nodes, modified_cls, mutant_names
+    return external_nodes, modified_cls, mutant_names, metadata_by_name
 
 
-def get_statements_until_func_or_class(statements: Sequence[MODULE_STATEMENT]) -> list[MODULE_STATEMENT]:
+def _get_statements_until_func_or_class(statements: Sequence[MODULE_STATEMENT]) -> list[MODULE_STATEMENT]:
     """Get all statements until we encounter the first function or class definition"""
     result: list[MODULE_STATEMENT] = []
 
@@ -575,7 +720,9 @@ def get_statements_until_func_or_class(statements: Sequence[MODULE_STATEMENT]) -
     return result
 
 
-def group_by_top_level_node(mutations: Sequence[Mutation]) -> Mapping[cst.CSTNode, Sequence[Mutation]]:
+def _group_by_top_level_node(
+    mutations: Sequence[Mutation],
+) -> Mapping[cst.CSTNode, Sequence[Mutation]]:
     grouped: dict[cst.CSTNode, list[Mutation]] = defaultdict(list)
     for m in mutations:
         if m.contained_by_top_level_function:
@@ -592,7 +739,7 @@ def pragma_no_mutate_lines(source: str) -> set[int]:
     }
 
 
-def deep_replace(
+def _deep_replace(
     tree: cst.CSTNode, old_node: cst.CSTNode, new_node: cst.CSTNode
 ) -> cst.CSTNode | cst.RemovalSentinel | cst.FlattenSentinel[cst.CSTNode]:
     """Like the CSTNode.deep_replace method, except that we only replace up to one occurrence of old_node."""

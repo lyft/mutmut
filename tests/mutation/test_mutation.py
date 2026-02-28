@@ -4,27 +4,27 @@ from unittest.mock import patch
 
 import libcst as cst
 import pytest
-
+from inline_snapshot import snapshot
 from mutmut.__main__ import CatchOutput
 from mutmut.__main__ import MutmutProgrammaticFailException
 from mutmut.__main__ import get_diff_for_mutant
 from mutmut.__main__ import orig_function_and_class_names_from_key
 from mutmut.__main__ import run_forced_fail_test
-from mutmut.mutation.file_mutation import create_mutations
+from mutmut.mutation.file_mutation import _create_mutations
 from mutmut.mutation.file_mutation import mutate_file_contents
 from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
 from mutmut.mutation.trampoline_templates import mangle_function_name
 
 
 def mutants_for_source(source: str, covered_lines: set[int] | None = None) -> list[str]:
-    module, mutated_nodes, _, _ = create_mutations(source, covered_lines)
+    module, mutated_nodes, _, _ = _create_mutations(source, covered_lines)
     mutants: list[str] = [module.deep_replace(m.original_node, m.mutated_node).code for m in mutated_nodes]  # type: ignore
 
     return mutants
 
 
 def mutated_module(source: str) -> str:
-    mutated_code, _ = mutate_file_contents("", source)
+    mutated_code, _, _, _ = mutate_file_contents(source)
     return mutated_code
 
 
@@ -659,7 +659,7 @@ class Color(Enum):
     def describe(self):
         return self.name.lower()
 """.strip()
-    mutated_code, _ = mutate_file_contents("", source, mutate_enums=False)
+    mutated_code, _, _, _ = mutate_file_contents(source, mutate_enums=False)
     # No mutation code should be added
     assert "__mutmut_mutants" not in mutated_code
     assert "_Color_describe_trampoline" not in mutated_code
@@ -683,7 +683,7 @@ class Color(Enum):
         return self.name.lower()
 """.strip()
 
-    mutated_code, mutant_names = mutate_file_contents("test.py", source)
+    mutated_code, mutant_names, _, _ = mutate_file_contents(source)
     assert len(mutant_names) > 0, "Should have at least one mutant"
 
     # Test original behavior
@@ -782,7 +782,7 @@ class Calculator:
         return a + b
 """.strip()
 
-    mutated_code, mutant_names = mutate_file_contents("test.py", source)
+    mutated_code, mutant_names, _, _ = mutate_file_contents(source)
     assert len(mutant_names) > 0, "Should have at least one mutant"
 
     old_env = os.environ.get("MUTANT_UNDER_TEST")
@@ -841,7 +841,7 @@ def test_mutate_dict():
 
 def test_syntax_error():
     with pytest.raises(cst.ParserSyntaxError):
-        mutate_file_contents("some_file.py", ":!")
+        mutate_file_contents(":!")
 
 
 def test_bug_github_issue_18():
@@ -956,7 +956,7 @@ class Foo:
 
     """.strip()
 
-    mutants_source, mutant_names = mutate_file_contents("filename", source)
+    mutants_source, mutant_names, _, _ = mutate_file_contents(source)
     assert len(mutant_names) == 2
 
     diff1 = get_diff_for_mutant(mutant_name=mutant_names[0], source=mutants_source, path="test.py").strip()
@@ -1107,3 +1107,169 @@ def x_foo__mutmut_1():
 
     mutants = mutants_for_source(source)
     assert mutants == [expected]
+
+
+def test_module_mutation():
+    source = """from __future__ import division
+import lib
+
+lib.foo()
+
+def foo(a, b):
+    return a > b
+
+def bar():
+    yield 1
+
+class Adder:
+    def __init__(self, amount):
+        self.amount = amount
+
+    def add(self, value):
+        return self.amount + value
+
+print(Adder(1).add(2))"""
+
+    src, _, _, _ = mutate_file_contents(source)
+
+    assert src == snapshot('''\
+from __future__ import division
+import lib
+
+lib.foo()
+from inspect import signature as _mutmut_signature # mutmut: generated
+from typing import Annotated # mutmut: generated
+from typing import Callable # mutmut: generated
+from typing import ClassVar # mutmut: generated
+
+
+MutantDict = Annotated[dict[str, Callable], "Mutant"] # type: ignore # mutmut: generated
+
+
+def _mutmut_trampoline(orig, mutants, call_args, call_kwargs, self_arg = None): # type: ignore # mutmut: generated
+    """Forward call to original or mutated function, depending on the environment""" # mutmut: generated
+    import os # type: ignore # mutmut: generated
+    mutant_under_test = os.environ.get('MUTANT_UNDER_TEST', '') # type: ignore # mutmut: generated
+    if not mutant_under_test: # mutmut: generated
+        # No mutant being tested - call original function
+        if self_arg is not None and not hasattr(orig, '__self__'): # mutmut: generated
+            return orig(self_arg, *call_args, **call_kwargs) # mutmut: generated
+        else: # mutmut: generated
+            return orig(*call_args, **call_kwargs) # mutmut: generated
+    if mutant_under_test == 'fail': # type: ignore # mutmut: generated
+        from mutmut.__main__ import MutmutProgrammaticFailException # type: ignore # mutmut: generated
+        raise MutmutProgrammaticFailException('Failed programmatically')       # type: ignore # mutmut: generated
+    elif mutant_under_test == 'stats': # type: ignore # mutmut: generated
+        from mutmut.__main__ import record_trampoline_hit # type: ignore # mutmut: generated
+        record_trampoline_hit(orig.__module__ + '.' + orig.__name__) # type: ignore # mutmut: generated
+        # Check if orig is a bound method (has __self__) or plain function
+        if self_arg is not None and not hasattr(orig, '__self__'): # type: ignore # mutmut: generated
+            result = orig(self_arg, *call_args, **call_kwargs) # type: ignore # mutmut: generated
+        else: # mutmut: generated
+            result = orig(*call_args, **call_kwargs) # type: ignore # mutmut: generated
+        return result # type: ignore # mutmut: generated
+    prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_' # type: ignore # mutmut: generated
+    if not mutant_under_test.startswith(prefix): # type: ignore # mutmut: generated
+        # Check if orig is a bound method (has __self__) or plain function
+        if self_arg is not None and not hasattr(orig, '__self__'): # type: ignore # mutmut: generated
+            result = orig(self_arg, *call_args, **call_kwargs) # type: ignore # mutmut: generated
+        else: # mutmut: generated
+            result = orig(*call_args, **call_kwargs) # type: ignore # mutmut: generated
+        return result # type: ignore # mutmut: generated
+    mutant_name = mutant_under_test.rpartition('.')[-1] # type: ignore # mutmut: generated
+    if self_arg is not None: # type: ignore # mutmut: generated
+        # call to a class method where self is not bound
+        result = mutants[mutant_name](self_arg, *call_args, **call_kwargs) # type: ignore # mutmut: generated
+    else: # mutmut: generated
+        result = mutants[mutant_name](*call_args, **call_kwargs) # type: ignore # mutmut: generated
+    return result # type: ignore # mutmut: generated
+
+def foo(a, b):
+    args = [a, b]# type: ignore
+    kwargs = {}# type: ignore
+    return _mutmut_trampoline(x_foo__mutmut_orig, x_foo__mutmut_mutants, args, kwargs, None)
+
+def x_foo__mutmut_orig(a, b):
+    return a > b
+
+def x_foo__mutmut_1(a, b):
+    return a >= b
+
+x_foo__mutmut_mutants : MutantDict = { # mutmut: generated
+'x_foo__mutmut_1': x_foo__mutmut_1 # mutmut: generated
+} # mutmut: generated
+
+def foo(*args, **kwargs): # mutmut: generated
+    result = _mutmut_trampoline(x_foo__mutmut_orig, x_foo__mutmut_mutants, args, kwargs) # mutmut: generated
+    return result # mutmut: generated
+
+foo.__signature__ = _mutmut_signature(x_foo__mutmut_orig) # mutmut: generated
+x_foo__mutmut_orig.__name__ = 'x_foo' # mutmut: generated
+
+def bar():
+    args = []# type: ignore
+    kwargs = {}# type: ignore
+    return _mutmut_trampoline(x_bar__mutmut_orig, x_bar__mutmut_mutants, args, kwargs, None)
+
+def x_bar__mutmut_orig():
+    yield 1
+
+def x_bar__mutmut_1():
+    yield 2
+
+x_bar__mutmut_mutants : MutantDict = { # mutmut: generated
+'x_bar__mutmut_1': x_bar__mutmut_1 # mutmut: generated
+} # mutmut: generated
+
+def bar(*args, **kwargs): # mutmut: generated
+    result = _mutmut_trampoline(x_bar__mutmut_orig, x_bar__mutmut_mutants, args, kwargs) # mutmut: generated
+    return result # mutmut: generated
+
+bar.__signature__ = _mutmut_signature(x_bar__mutmut_orig) # mutmut: generated
+x_bar__mutmut_orig.__name__ = 'x_bar' # mutmut: generated
+
+class Adder:
+    def __init__(self, amount):
+        args = [amount]# type: ignore
+        kwargs = {}# type: ignore
+        return _mutmut_trampoline(object.__getattribute__(self, 'xǁAdderǁ__init____mutmut_orig'), object.__getattribute__(self, 'xǁAdderǁ__init____mutmut_mutants'), args, kwargs, self)
+    def xǁAdderǁ__init____mutmut_orig(self, amount):
+        self.amount = amount
+    def xǁAdderǁ__init____mutmut_1(self, amount):
+        self.amount = None
+
+    xǁAdderǁ__init____mutmut_mutants : ClassVar[MutantDict] = { # mutmut: generated
+    'xǁAdderǁ__init____mutmut_1': xǁAdderǁ__init____mutmut_1 # mutmut: generated
+    } # mutmut: generated
+
+    def __init__(self, *args, **kwargs): # mutmut: generated
+        result = _mutmut_trampoline(object.__getattribute__(self, "xǁAdderǁ__init____mutmut_orig"), object.__getattribute__(self, "xǁAdderǁ__init____mutmut_mutants"), args, kwargs, self) # mutmut: generated
+        return result # mutmut: generated
+
+    __init__.__signature__ = _mutmut_signature(xǁAdderǁ__init____mutmut_orig) # mutmut: generated
+    xǁAdderǁ__init____mutmut_orig.__name__ = 'xǁAdderǁ__init__' # mutmut: generated
+
+    def add(self, value):
+        args = [value]# type: ignore
+        kwargs = {}# type: ignore
+        return _mutmut_trampoline(object.__getattribute__(self, 'xǁAdderǁadd__mutmut_orig'), object.__getattribute__(self, 'xǁAdderǁadd__mutmut_mutants'), args, kwargs, self)
+
+    def xǁAdderǁadd__mutmut_orig(self, value):
+        return self.amount + value
+
+    def xǁAdderǁadd__mutmut_1(self, value):
+        return self.amount - value
+
+    xǁAdderǁadd__mutmut_mutants : ClassVar[MutantDict] = { # mutmut: generated
+    'xǁAdderǁadd__mutmut_1': xǁAdderǁadd__mutmut_1 # mutmut: generated
+    } # mutmut: generated
+
+    def add(self, *args, **kwargs): # mutmut: generated
+        result = _mutmut_trampoline(object.__getattribute__(self, "xǁAdderǁadd__mutmut_orig"), object.__getattribute__(self, "xǁAdderǁadd__mutmut_mutants"), args, kwargs, self) # mutmut: generated
+        return result # mutmut: generated
+
+    add.__signature__ = _mutmut_signature(xǁAdderǁadd__mutmut_orig) # mutmut: generated
+    xǁAdderǁadd__mutmut_orig.__name__ = 'xǁAdderǁadd' # mutmut: generated
+
+print(Adder(1).add(2))\
+''')
