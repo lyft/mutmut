@@ -60,13 +60,13 @@ from mutmut.models.source_file_mutation_data import SourceFileMutationData
 from mutmut.mutation.file_mutation import filter_mutants_with_type_checker
 from mutmut.mutation.file_mutation import mutate_file_contents
 from mutmut.state import state
-from mutmut.threading.timeout import register_timeout
 from mutmut.utils.file_utils import change_cwd
 from mutmut.utils.format_utils import get_module_from_key
 from mutmut.utils.format_utils import mangled_name_from_mutant_name
 from mutmut.utils.format_utils import orig_function_and_class_names_from_key
 from mutmut.utils.format_utils import strip_prefix
 from mutmut.utils.safe_setproctitle import safe_setproctitle as setproctitle
+from mutmut.workers.timeout import register_timeout
 
 # Document: surviving mutants are retested when you ask mutmut to retest them, interactively in the UI or via command line
 
