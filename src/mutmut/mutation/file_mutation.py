@@ -9,8 +9,8 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import Union
-from typing import cast
 
 import libcst as cst
 import libcst.matchers as m
@@ -19,26 +19,23 @@ from libcst.metadata import PositionProvider
 
 from mutmut.configuration import Config
 from mutmut.mutation.enum_mutation import is_enum_class
-from mutmut.mutation.mutators import get_method_type
-from mutmut.mutation.mutators import MethodType
 from mutmut.mutation.mutators import MUTATION_OPERATORS
-from mutmut.mutation.mutators import operator_swap_op
 from mutmut.mutation.mutators import OPERATOR_TO_TYPE
 from mutmut.mutation.mutators import OPERATORS_TYPE
 from mutmut.mutation.mutators import MethodType
 from mutmut.mutation.mutators import get_method_type
-from mutmut.mutation.mutators import mutation_operators
+from mutmut.mutation.mutators import operator_swap_op
 from mutmut.mutation.pragma_handling import parse_pragma_lines
 from mutmut.mutation.trampoline_templates import GENERATED_MARKER
 from mutmut.mutation.trampoline_templates import build_enum_trampoline
 from mutmut.mutation.trampoline_templates import build_function_trampoline
-from mutmut.mutation.trampoline_templates import mangle_function_name
 from mutmut.mutation.trampoline_templates import trampoline_impl
 from mutmut.type_checking import TypeCheckingError
 from mutmut.type_checking import run_type_checker
 from mutmut.utils.file_utils import change_cwd
 from mutmut.utils.format_utils import get_mutant_name
 from mutmut.utils.format_utils import is_mutated_method_name
+from mutmut.utils.format_utils import mangle_function_name
 
 NEVER_MUTATE_FUNCTION_NAMES = {"__getattribute__", "__setattr__", "__new__"}
 NEVER_MUTATE_FUNCTION_CALLS = {"len", "isinstance"}

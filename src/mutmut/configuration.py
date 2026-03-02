@@ -110,6 +110,8 @@ def _load_config() -> Config:
         pytest_add_cli_args=s("pytest_add_cli_args", []),
         pytest_add_cli_args_test_selection=s("pytest_add_cli_args_test_selection", []),
         type_check_command=s("type_check_command", []),
+        track_dependencies=s("track_dependencies", True),
+        dependency_tracking_depth=s("dependency_tracking_depth", None),
     )
 
 
@@ -128,6 +130,8 @@ class Config:
     tests_dir: list[str]
     mutate_only_covered_lines: bool
     type_check_command: list[str]
+    track_dependencies: bool
+    dependency_tracking_depth: int | None
 
     def should_ignore_for_mutation(self, path: Path | str) -> bool:
         path_str = str(path)

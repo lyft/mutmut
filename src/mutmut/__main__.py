@@ -8,6 +8,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from mutmut.utils.file_utils import change_cwd
+from mutmut.utils.format_utils import mangled_name_from_mutant_name
+from mutmut.utils.format_utils import orig_function_and_class_names_from_key
 from mutmut.utils.format_utils import strip_prefix
 
 if platform.system() == "Windows":
@@ -16,10 +18,10 @@ if platform.system() == "Windows":
     )
     sys.exit(1)
 import ast
-import io
 import fnmatch
 import gc
 import inspect
+import io
 import itertools
 import json
 import resource
@@ -57,12 +59,14 @@ import mutmut
 from mutmut.code_coverage import gather_coverage
 from mutmut.code_coverage import get_covered_lines_for_file
 from mutmut.configuration import Config
+from mutmut.core import MutmutProgrammaticFailException
 from mutmut.mutation.data import SourceFileMutationData
+from mutmut.mutation.file_mutation import MutationMetadata
 from mutmut.mutation.file_mutation import filter_mutants_with_type_checker
 from mutmut.mutation.file_mutation import mutate_file_contents
-from mutmut.mutation.trampoline_templates import CLASS_NAME_SEPARATOR
-from mutmut.mutation.file_mutation import MutationMetadata
+from mutmut.state import state
 from mutmut.threading.timeout import register_timeout
+from mutmut.utils.format_utils import get_module_from_key
 from mutmut.utils.safe_setproctitle import safe_setproctitle as setproctitle
 
 # Document: surviving mutants are retested when you ask mutmut to retest them, interactively in the UI or via command line
@@ -145,10 +149,6 @@ def walk_source_files() -> Iterator[Path]:
             yield Path(root) / filename
 
 
-class MutmutProgrammaticFailException(Exception):
-    pass
-
-
 class CollectTestsFailedException(Exception):
     pass
 
@@ -219,6 +219,8 @@ def create_mutants(max_children: int) -> MutantGenerationStats:
                 stats.ignored += 1
             else:
                 stats.mutated += 1
+            if result.current_hashes:
+                state().current_function_hashes.update(result.current_hashes)
     return stats
 
 
@@ -565,24 +567,6 @@ class HammettRunner(TestRunner):
         return int(hammett.main_run_tests(**self.hammett_kwargs, tests=tests))
 
 
-def mangled_name_from_mutant_name(mutant_name: str) -> str:
-    assert "__mutmut_" in mutant_name, mutant_name
-    return mutant_name.partition("__mutmut_")[0]
-
-
-def orig_function_and_class_names_from_key(mutant_name: str) -> tuple[str, str | None]:
-    r = mangled_name_from_mutant_name(mutant_name)
-    _, _, r = r.rpartition(".")
-    class_name = None
-    if CLASS_NAME_SEPARATOR in r:
-        class_name = r[r.index(CLASS_NAME_SEPARATOR) + 1 : r.rindex(CLASS_NAME_SEPARATOR)]
-        r = r[r.rindex(CLASS_NAME_SEPARATOR) + 1 :]
-    else:
-        assert r.startswith("x_"), r
-        r = r[2:]
-    return r, class_name
-
-
 spinner = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
 
@@ -786,13 +770,22 @@ def run_stats_collection(runner: TestRunner, tests: Iterable[str] | None = None)
     save_stats()
 
 
-def collect_or_load_stats(runner: TestRunner) -> None:
+def collect_or_load_stats(runner: TestRunner, invalidate_stale_callers: bool = True) -> None:
     did_load = load_stats()
 
     if not did_load:
         # Run full stats
         run_stats_collection(runner)
     else:
+        # Clean up stats for deleted source files
+        _cleanup_stale_stats()
+
+        if Config.get().track_dependencies and invalidate_stale_callers:
+            _invalidate_stale_dependency_edges()
+
+        # Save to persist the cleanup
+        save_stats()
+
         # Run incremental stats
         with CatchOutput(spinner_title="Listing all tests") as output_catcher:
             os.environ["MUTANT_UNDER_TEST"] = "list_all_tests"
@@ -816,11 +809,15 @@ def load_stats() -> bool:
     did_load = False
     try:
         with open("mutants/mutmut-stats.json") as f:
-            data = json.load(f)
-            for k, v in data.pop("tests_by_mangled_function_name").items():
+            data: dict[str, object] = json.load(f)
+            for k, v in data.pop("tests_by_mangled_function_name").items():  # type: ignore[attr-defined]
                 mutmut.tests_by_mangled_function_name[k] |= set(v)
-            mutmut.duration_by_test = data.pop("duration_by_test")
-            mutmut.stats_time = data.pop("stats_time")
+            mutmut.duration_by_test = data.pop("duration_by_test")  # type: ignore[assignment]
+            mutmut.stats_time = data.pop("stats_time")  # type: ignore[assignment]
+            # Load function hashes and dependencies (backwards compatible)
+            state().old_function_hashes = data.pop("function_hashes", {})  # type: ignore[assignment]
+            for k, v in data.pop("function_dependencies", {}).items():  # type: ignore[attr-defined]
+                state().function_dependencies[k] = set(v)
             assert not data, data
             did_load = True
     except (FileNotFoundError, JSONDecodeError):
@@ -831,11 +828,15 @@ def load_stats() -> bool:
 def save_stats() -> None:
     with open("mutants/mutmut-stats.json", "w") as f:
         json.dump(
-            dict(
-                tests_by_mangled_function_name={k: list(v) for k, v in mutmut.tests_by_mangled_function_name.items()},
-                duration_by_test=mutmut.duration_by_test,
-                stats_time=mutmut.stats_time,
-            ),
+            {
+                "tests_by_mangled_function_name": {
+                    k: list(v) for k, v in mutmut.tests_by_mangled_function_name.items()
+                },
+                "duration_by_test": mutmut.duration_by_test,
+                "stats_time": mutmut.stats_time,
+                "function_hashes": state().current_function_hashes,
+                "function_dependencies": {k: list(v) for k, v in state().function_dependencies.items()},
+            },
             f,
             indent=4,
         )
@@ -1260,6 +1261,68 @@ def get_diff_for_mutant(
             )
         ]
     )
+
+
+def _cleanup_stale_stats() -> None:
+    """Remove stats entries for source files that no longer exist."""
+    # Derive valid modules from current_function_hashes (populated during mutant generation)
+    valid_modules = {get_module_from_key(key) for key in state().current_function_hashes}
+
+    def _is_valid_key(key: str) -> bool:
+        """Check if the key's module exists in current source files."""
+        module = get_module_from_key(key)
+        return module in valid_modules
+
+    # Clean up tests_by_mangled_function_name - O(n) with set lookup
+    stale_keys = [k for k in mutmut.tests_by_mangled_function_name if not _is_valid_key(k)]
+    for k in stale_keys:
+        del mutmut.tests_by_mangled_function_name[k]
+
+    # Clean up function_dependencies (both keys and values)
+    stale_dep_keys = [k for k in state().function_dependencies if not _is_valid_key(k)]
+    for k in stale_dep_keys:
+        del state().function_dependencies[k]
+
+    # Also clean up stale callers in dependency values
+    for _, callers in state().function_dependencies.items():
+        stale_callers = {c for c in callers if not _is_valid_key(c)}
+        callers -= stale_callers
+
+
+def _invalidate_stale_dependency_edges() -> set[str]:
+    """Remove changed functions from all caller sets in function_dependencies.
+
+    When a function's code changes (hash differs), its outgoing call edges may
+    have changed. We remove it from all callers_of[*] sets so stats collection
+    can rebuild the correct edges.
+
+    Returns the set of changed function names.
+    """
+    old_hashes = state().old_function_hashes
+    new_hashes = state().current_function_hashes
+
+    if not old_hashes:
+        # First run or no previous stats - nothing to invalidate
+        return set()
+
+    # Find functions whose code changed (different hash) or were added/removed
+    all_functions = old_hashes.keys() | new_hashes.keys()
+    changed_functions = {f for f in all_functions if old_hashes.get(f) != new_hashes.get(f)}
+
+    if not changed_functions:
+        return set()
+
+    # Remove changed functions from all caller sets
+    # (their outgoing edges are now unknown/stale)
+    for callers in state().function_dependencies.values():
+        callers -= changed_functions
+
+    # Also remove keys for deleted functions
+    deleted_functions = old_hashes.keys() - new_hashes.keys()
+    for f in deleted_functions:
+        state().function_dependencies.pop(f, None)
+
+    return changed_functions
 
 
 @cli.command()

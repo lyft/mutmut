@@ -1,4 +1,5 @@
 from mutmut.mutation.mutators import MethodType
+from mutmut.utils.format_utils import mangle_function_name
 
 CLASS_NAME_SEPARATOR = "ǁ"
 
@@ -14,16 +15,6 @@ def _mark_generated(code: str) -> str:
             line = f"{line} {GENERATED_MARKER}"
         lines.append(line)
     return "\n".join(lines)
-
-
-def mangle_function_name(*, name: str, class_name: str | None) -> str:
-    assert CLASS_NAME_SEPARATOR not in name
-    if class_name:
-        assert CLASS_NAME_SEPARATOR not in class_name
-        prefix = f"x{CLASS_NAME_SEPARATOR}{class_name}{CLASS_NAME_SEPARATOR}"
-    else:
-        prefix = "x_"
-    return f"{prefix}{name}"
 
 
 def build_function_trampoline(
@@ -133,10 +124,14 @@ def {prefix}_trampoline(self, *args, **kwargs):
 # noinspection PyUnresolvedReferences
 # language=python
 trampoline_impl = _mark_generated("""
+import os
 from functools import wraps as _mutmut_wraps
 from typing import Annotated
 from typing import Callable
 from typing import ClassVar
+from mutmut.core import MutmutProgrammaticFailException
+from mutmut.core import record_trampoline_hit
+from mutmut.core import MutmutCallStack
 
 
 MutantDict = Annotated[dict[str, Callable], "Mutant"] # type: ignore
@@ -144,7 +139,6 @@ MutantDict = Annotated[dict[str, Callable], "Mutant"] # type: ignore
 
 def _mutmut_trampoline(orig, mutants, call_args, call_kwargs, self_arg = None): # type: ignore
     \"""Forward call to original or mutated function, depending on the environment\"""
-    import os # type: ignore
     mutant_under_test = os.environ.get('MUTANT_UNDER_TEST', '') # type: ignore
     if not mutant_under_test:
         # No mutant being tested - call original function
@@ -152,20 +146,43 @@ def _mutmut_trampoline(orig, mutants, call_args, call_kwargs, self_arg = None): 
             return orig(self_arg, *call_args, **call_kwargs)
         else:
             return orig(*call_args, **call_kwargs)
-    if mutant_under_test == 'fail': # type: ignore
-        from mutmut.__main__ import MutmutProgrammaticFailException # type: ignore
-        raise MutmutProgrammaticFailException('Failed programmatically')       # type: ignore
-    elif mutant_under_test == 'stats': # type: ignore
-        from mutmut.__main__ import record_trampoline_hit # type: ignore
-        record_trampoline_hit(orig.__module__ + '.' + orig.__name__) # type: ignore
-        # Check if orig is a bound method (has __self__) or plain function
-        if self_arg is not None and not hasattr(orig, '__self__'): # type: ignore
-            result = orig(self_arg, *call_args, **call_kwargs) # type: ignore
+    if mutant_under_test == 'fail':
+        raise MutmutProgrammaticFailException('Failed programmatically')
+    elif mutant_under_test == 'stats':
+        my_name = orig.__module__ + '.' + orig.__name__
+        # Normalize module names - strip 'mutants.' prefix for consistency with test mappings
+        if my_name.startswith('mutants.'):
+            my_name = my_name[8:]  # len('mutants.') == 8
+
+        caller_name, depth = MutmutCallStack.get()
+
+        # Also normalize caller name
+        if caller_name and caller_name.startswith('mutants.'):
+            caller_name = caller_name[8:]
+
+        max_depth = int(os.environ.get("MUTMUT_DEPENDENCY_DEPTH", "-1"))
+
+        if max_depth == -1 or depth < max_depth:
+            record_trampoline_hit(my_name, caller=caller_name)
+
+            token = MutmutCallStack.set((my_name, depth + 1))
+            try:
+                if self_arg is not None and not hasattr(orig, "__self__"):
+                    result = orig(self_arg, *call_args, **call_kwargs)
+                else:
+                    result = orig(*call_args, **call_kwargs)
+                return result
+            finally:
+                MutmutCallStack.reset(token)
         else:
-            result = orig(*call_args, **call_kwargs) # type: ignore
-        return result # type: ignore
-    prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_' # type: ignore
-    if not mutant_under_test.startswith(prefix): # type: ignore
+            # Depth exceeded — still call but don't track deeper
+            if self_arg is not None and not hasattr(orig, "__self__"):
+                result = orig(self_arg, *call_args, **call_kwargs)
+            else:
+                result = orig(*call_args, **call_kwargs)
+            return result
+    prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_'
+    if not mutant_under_test.startswith(prefix):
         # Check if orig is a bound method (has __self__) or plain function
         if self_arg is not None and not hasattr(orig, '__self__'): # type: ignore
             result = orig(self_arg, *call_args, **call_kwargs) # type: ignore
