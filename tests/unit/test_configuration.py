@@ -61,6 +61,7 @@ class TestShouldIgnoreForMutation:
             tests_dir=[],
             mutate_only_covered_lines=False,
             type_check_command=[],
+            mutate_enums=True,
             track_dependencies=False,
             dependency_tracking_depth=None,
             process_isolation=ProcessIsolation.FORK,
@@ -86,6 +87,7 @@ class TestShouldIgnoreForMutation:
             tests_dir=[],
             mutate_only_covered_lines=False,
             type_check_command=[],
+            mutate_enums=True,
             track_dependencies=False,
             dependency_tracking_depth=None,
             process_isolation=ProcessIsolation.FORK,
@@ -110,6 +112,7 @@ class TestShouldIgnoreForMutation:
             tests_dir=[],
             mutate_only_covered_lines=False,
             type_check_command=[],
+            mutate_enums=True,
             track_dependencies=False,
             dependency_tracking_depth=None,
             process_isolation=ProcessIsolation.FORK,
@@ -134,6 +137,7 @@ class TestShouldIgnoreForMutation:
             tests_dir=[],
             mutate_only_covered_lines=False,
             type_check_command=[],
+            mutate_enums=True,
             track_dependencies=False,
             dependency_tracking_depth=None,
             process_isolation=ProcessIsolation.FORK,
@@ -159,6 +163,7 @@ class TestShouldIgnoreForMutation:
             tests_dir=[],
             mutate_only_covered_lines=False,
             type_check_command=[],
+            mutate_enums=True,
             track_dependencies=False,
             dependency_tracking_depth=None,
             process_isolation=ProcessIsolation.FORK,
@@ -168,6 +173,110 @@ class TestShouldIgnoreForMutation:
         )
         assert config.should_ignore_for_mutation(Path("foo.py")) is True
         assert config.should_ignore_for_mutation(Path("bar.py")) is False
+
+
+class TestConfigDependencyDepth:
+    """Tests for dependency_tracking_depth configuration."""
+
+    def test_defaults_to_max_stack_depth(self):
+        """When not set, dependency depth defaults to max_stack_depth."""
+        config = Config(
+            also_copy=[],
+            do_not_mutate=[],
+            max_stack_depth=5,
+            debug=False,
+            log_to_file=False,
+            log_file_path="mutants/mutmut-debug.log",
+            paths_to_mutate=[Path(".")],
+            pytest_add_cli_args=[],
+            pytest_add_cli_args_test_selection=[],
+            tests_dir=[],
+            mutate_only_covered_lines=False,
+            type_check_command=[],
+            mutate_enums=True,
+            process_isolation=ProcessIsolation.FORK,
+            max_orchestrator_restarts=3,
+            track_dependencies=True,
+            dependency_tracking_depth=None,
+            hot_fork_warmup=HotForkWarmup.COLLECT,
+            preload_modules_file=None,
+        )
+        assert config.get_effective_dependency_depth() == 5
+
+    def test_respects_explicit_depth(self):
+        """Explicit depth is used when set."""
+        config = Config(
+            also_copy=[],
+            do_not_mutate=[],
+            max_stack_depth=10,
+            debug=False,
+            log_to_file=False,
+            log_file_path="mutants/mutmut-debug.log",
+            paths_to_mutate=[Path(".")],
+            pytest_add_cli_args=[],
+            pytest_add_cli_args_test_selection=[],
+            tests_dir=[],
+            mutate_only_covered_lines=False,
+            type_check_command=[],
+            mutate_enums=True,
+            process_isolation=ProcessIsolation.FORK,
+            max_orchestrator_restarts=3,
+            track_dependencies=True,
+            dependency_tracking_depth=3,
+            hot_fork_warmup=HotForkWarmup.COLLECT,
+            preload_modules_file=None,
+        )
+        assert config.get_effective_dependency_depth() == 3
+
+    def test_clamped_to_max_stack_depth(self):
+        """Explicit depth cannot exceed max_stack_depth."""
+        config = Config(
+            also_copy=[],
+            do_not_mutate=[],
+            max_stack_depth=5,
+            debug=False,
+            log_to_file=False,
+            log_file_path="mutants/mutmut-debug.log",
+            paths_to_mutate=[Path(".")],
+            pytest_add_cli_args=[],
+            pytest_add_cli_args_test_selection=[],
+            tests_dir=[],
+            mutate_only_covered_lines=False,
+            type_check_command=[],
+            mutate_enums=True,
+            process_isolation=ProcessIsolation.FORK,
+            max_orchestrator_restarts=3,
+            track_dependencies=True,
+            dependency_tracking_depth=10,  # Higher than max_stack_depth
+            hot_fork_warmup=HotForkWarmup.COLLECT,
+            preload_modules_file=None,
+        )
+        assert config.get_effective_dependency_depth() == 5  # Clamped
+
+    def test_unlimited_max_stack_depth(self):
+        """When max_stack_depth is -1, explicit depth is used."""
+        config = Config(
+            also_copy=[],
+            do_not_mutate=[],
+            max_stack_depth=-1,  # Unlimited
+            debug=False,
+            log_to_file=False,
+            log_file_path="mutants/mutmut-debug.log",
+            paths_to_mutate=[Path(".")],
+            pytest_add_cli_args=[],
+            pytest_add_cli_args_test_selection=[],
+            tests_dir=[],
+            mutate_only_covered_lines=False,
+            type_check_command=[],
+            mutate_enums=True,
+            process_isolation=ProcessIsolation.FORK,
+            max_orchestrator_restarts=3,
+            track_dependencies=True,
+            dependency_tracking_depth=10,
+            hot_fork_warmup=HotForkWarmup.COLLECT,
+            preload_modules_file=None,
+        )
+        assert config.get_effective_dependency_depth() == 10
 
 
 class TestConfigReaderPyprojectToml:

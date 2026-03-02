@@ -43,6 +43,90 @@ NEVER_MUTATE_FUNCTION_NAMES = {"__getattribute__", "__setattr__", "__new__"}
 NEVER_MUTATE_FUNCTION_CALLS = {"len", "isinstance"}
 
 
+def _compute_function_hash(func: cst.FunctionDef) -> str | None:
+    """Compute a hash for a single function using AST normalization.
+
+    The hash ignores whitespace and comments, making it stable across formatting changes.
+
+    :param func: The function definition to hash
+    :return: A 12-character hex hash, or None if the function can't be parsed
+    """
+    func_code = cst.Module([func]).code
+    try:
+        tree = ast.parse(func_code)
+        normalized = ast.dump(tree, annotate_fields=False)
+        return hashlib.sha256(normalized.encode()).hexdigest()[:12]
+    except SyntaxError:
+        return None
+
+
+def _get_class_by_method(module: cst.Module) -> dict[cst.FunctionDef, str]:
+    """Build a mapping from method to its containing class name.
+
+    :param module: The parsed module
+    :return: Dict mapping FunctionDef nodes to their class names
+    """
+    class_by_method: dict[cst.FunctionDef, str] = {}
+    for statement in module.body:
+        if isinstance(statement, cst.ClassDef) and isinstance(statement.body, cst.IndentedBlock):
+            for item in statement.body.body:
+                if isinstance(item, cst.FunctionDef):
+                    class_by_method[item] = statement.name.value
+    return class_by_method
+
+
+def _hash_functions(
+    functions: Iterable[cst.FunctionDef],
+    class_by_method: dict[cst.FunctionDef, str],
+) -> dict[str, str]:
+    """Compute hashes for a collection of functions.
+
+    :param functions: Functions to hash
+    :param class_by_method: Mapping from method to class name
+    :return: Dict mapping mangled function name to its hash
+    """
+    hash_by_function_name: dict[str, str] = {}
+    for func in functions:
+        func_hash = _compute_function_hash(func)
+        if func_hash is None:
+            continue
+
+        func_name = func.name.value
+        class_name = class_by_method.get(func)
+        key = mangle_function_name(name=func_name, class_name=class_name)
+        hash_by_function_name[key] = func_hash
+
+    return hash_by_function_name
+
+
+def compute_current_function_hashes(source_code: str) -> dict[str, str]:
+    """Compute hashes for all functions in source code.
+
+    This is used by the browser to determine cache validity by comparing
+    current function hashes with stored hashes from the last mutation run.
+
+    :param source_code: The source code to parse
+    :return: Dict mapping mangled function name to its hash
+    """
+    try:
+        module = cst.parse_module(source_code)
+    except cst.ParserSyntaxError:
+        return {}
+
+    # Collect all functions (top-level and methods)
+    all_functions: list[cst.FunctionDef] = []
+    for statement in module.body:
+        if isinstance(statement, cst.FunctionDef):
+            all_functions.append(statement)
+        elif isinstance(statement, cst.ClassDef) and isinstance(statement.body, cst.IndentedBlock):
+            for item in statement.body.body:
+                if isinstance(item, cst.FunctionDef):
+                    all_functions.append(item)
+
+    class_by_method = _get_class_by_method(module)
+    return _hash_functions(all_functions, class_by_method)
+
+
 def _compute_function_hashes(module: cst.Module, mutations: Sequence["Mutation"]) -> dict[str, str]:
     """Compute a hash for each function that has mutations.
 
@@ -54,44 +138,20 @@ def _compute_function_hashes(module: cst.Module, mutations: Sequence["Mutation"]
     :param mutations: List of mutations (used to identify which functions were mutated)
     :return: Dict mapping function name to its hash
     """
-    hash_by_function_name: dict[str, str] = {}
-
     # Get unique functions that have mutations (only FunctionDef nodes)
-    mutated_functions: set[cst.FunctionDef] = set()
-    for mutation in mutations:
-        if mutation.contained_by_top_level_function and isinstance(
-            mutation.contained_by_top_level_function, cst.FunctionDef
-        ):
-            mutated_functions.add(mutation.contained_by_top_level_function)
+    mutated_functions: set[cst.FunctionDef] = {
+        mutation.contained_by_top_level_function
+        for mutation in mutations
+        if mutation.contained_by_top_level_function
+        and isinstance(mutation.contained_by_top_level_function, cst.FunctionDef)
+    }
 
-    # Find class names for methods
-    class_by_method: dict[cst.FunctionDef, str] = {}
-    for statement in module.body:
-        if isinstance(statement, cst.ClassDef) and isinstance(statement.body, cst.IndentedBlock):
-            for item in statement.body.body:
-                if isinstance(item, cst.FunctionDef):
-                    class_by_method[item] = statement.name.value
-
-    # Compute hash for each mutated function using AST normalization
-    # This ignores whitespace and comments, making the hash stable across formatting changes
-    for func in mutated_functions:
-        func_code = cst.Module([func]).code
-        # Parse to AST and dump without field annotations for a normalized representation
-        tree = ast.parse(func_code)
-        normalized = ast.dump(tree, annotate_fields=False)
-        func_hash = hashlib.sha256(normalized.encode()).hexdigest()[:12]
-
-        func_name = func.name.value
-        class_name = class_by_method.get(func)
-        key = mangle_function_name(name=func_name, class_name=class_name)
-
-        hash_by_function_name[key] = func_hash
-
-    return hash_by_function_name
+    class_by_method = _get_class_by_method(module)
+    return _hash_functions(mutated_functions, class_by_method)
 
 
 def mutate_file_contents(
-    code: str, covered_lines: set[int] | None = None, mutate_enums: bool = True
+    code: str, covered_lines: set[int] | None = None
 ) -> tuple[str, Sequence[str], dict[str, str], dict[str, MutationMetadata]]:
     """Create mutations for `code` and merge them to a single mutated file with trampolines.
 
@@ -102,7 +162,7 @@ def mutate_file_contents(
     module, mutations, ignored_classes, ignored_functions = _create_mutations(code, covered_lines)
 
     mutated_code, mutant_names, metadata_by_name = _combine_mutations_to_source(
-        module, mutations, ignored_classes, ignored_functions, mutate_enums=mutate_enums
+        module, mutations, ignored_classes, ignored_functions
     )
 
     hash_by_function_name = _compute_function_hashes(module, mutations)
@@ -334,7 +394,6 @@ def _combine_mutations_to_source(
     mutations: Sequence[Mutation],
     ignored_classes: set[str] | None = None,
     ignored_functions: set[str] | None = None,
-    mutate_enums: bool = True,
 ) -> tuple[str, Sequence[str], dict[str, MutationMetadata]]:
     """Create mutated functions and trampolines for all mutations and compile them to a single source code.
 
@@ -342,7 +401,6 @@ def _combine_mutations_to_source(
     :param mutations: Mutations that should be applied.
     :param ignored_classes: Class names to skip transformation for (e.g., enums with pragma: no mutate class)
     :param ignored_functions: Function names to skip transformation for (pragma: no mutate function)
-    :param mutate_enums: Whether to mutate enum classes (True) or skip them entirely (False)
 
     :return: Tuple of (mutated code, list of mutation names, metadata_by_name)"""
     ignored_classes = ignored_classes or set()
@@ -389,7 +447,7 @@ def _combine_mutations_to_source(
                 # we don't mutate single-line classes, e.g. `class A: a = 1; b = 2`
                 result.append(cls)
             elif is_enum_class(cls):
-                if not mutate_enums:
+                if not config().mutate_enums:
                     result.append(cls)
                     continue
                 external_nodes, modified_cls, enum_mutant_names, enum_metadata = _enum_trampoline_arrangement(

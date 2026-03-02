@@ -19,7 +19,6 @@ import warnings
 from collections.abc import Sequence
 from datetime import datetime
 from difflib import unified_diff
-from json import JSONDecodeError
 from math import ceil
 from multiprocessing import Pool
 from multiprocessing import set_start_method
@@ -47,8 +46,8 @@ from mutmut.runners.harness import collected_test_names
 from mutmut.runners.harness import strip_prefix
 from mutmut.state import state
 from mutmut.stats import calculate_summary_stats
-from mutmut.stats import collect_stat
 from mutmut.stats import emoji_by_status
+from mutmut.stats import load_stats
 from mutmut.stats import print_stats
 from mutmut.stats import save_stats
 from mutmut.stats import status_by_exit_code
@@ -60,7 +59,7 @@ from mutmut.utils.file_utils import setup_source_paths
 from mutmut.utils.file_utils import walk_source_files
 from mutmut.utils.format_utils import get_module_from_key
 from mutmut.utils.format_utils import mangled_name_from_mutant_name
-from mutmut.utils.format_utils import orig_function_and_class_names_from_key
+from mutmut.utils.format_utils import orig_function_and_class_names_from_mutant_name
 from mutmut.utils.logging_utils import get_logger
 from mutmut.utils.logging_utils import setup_file_logging
 from mutmut.workers.isolation import MutantResult
@@ -323,26 +322,6 @@ def collect_or_load_stats(runner: MutantRunner, invalidate_stale_callers: bool =
             run_stats_collection(runner, tests=new_tests)
 
 
-def load_stats() -> bool:
-    did_load = False
-    try:
-        with open("mutants/mutmut-stats.json") as f:
-            data: dict[str, object] = json.load(f)
-            for k, v in data.pop("tests_by_mangled_function_name").items():  # type: ignore[attr-defined]
-                state().tests_by_mangled_function_name[k] |= set(v)
-            state().duration_by_test = data.pop("duration_by_test")  # type: ignore[assignment]
-            state().stats_time = data.pop("stats_time")  # type: ignore[assignment]
-            # Load function hashes and dependencies (backwards compatible)
-            state().old_function_hashes = data.pop("function_hashes", {})  # type: ignore[assignment]
-            for k, v in data.pop("function_dependencies", {}).items():  # type: ignore[attr-defined]
-                state().function_dependencies[k] = set(v)
-            assert not data, data
-            did_load = True
-    except (FileNotFoundError, JSONDecodeError):
-        pass
-    return did_load
-
-
 def save_cicd_stats(source_file_mutation_data_by_path: dict[str, SourceFileMutationData]) -> None:
     s = calculate_summary_stats(source_file_mutation_data_by_path)
     with open("mutants/mutmut-cicd-stats.json", "w") as f:
@@ -427,6 +406,42 @@ def estimated_worst_case_time(mutant_name: str) -> float:
     return sum(state().duration_by_test[t] for t in tests)
 
 
+def generate_mutants(max_children: int) -> None:
+    makedirs(Path("mutants"), exist_ok=True)
+    with SpinnerTask("Generating mutants", debug=config().debug) as task:
+        copy_src_dir()
+        copy_also_copy_files()
+        setup_source_paths()
+        store_lines_covered_by_tests()
+        create_mutants(max_children)
+
+    state().mutant_generation_time = task.elapsed_seconds
+    logger.info("Mutant generation completed in %.2f seconds", state().mutant_generation_time)
+
+
+@cli.command()
+@click.option("--max-children", type=int)
+@click.option(
+    "--invalidate-callers/--no-invalidate-callers", is_flag=True, default=True, help="Invalidate stale callers."
+)
+def generate(max_children: int | None, invalidate_callers: bool) -> None:
+    """Regenerate mutants and update function hashes without running tests.
+
+    This updates the validity status of mutants by:
+    - Regenerating all mutants (detecting changed functions)
+    - Updating function hashes
+    - Preserving existing test results for unchanged functions
+    """
+    if max_children is None:
+        max_children = os.cpu_count() or 4
+
+    generate_mutants(max_children)
+
+    mutation_runner: MutantRunner = get_mutant_runner(max_children)
+
+    collect_or_load_stats(mutation_runner, invalidate_stale_callers=invalidate_callers)
+
+
 @cli.command()
 @click.argument("mutant_names", required=False, nargs=-1)
 def print_time_estimates(mutant_names: tuple[str, ...]) -> None:
@@ -502,16 +517,7 @@ def _run(mutant_names: tuple[str, ...] | list[str], max_children: int | None, fr
 
     logger.info("Using %d workers", max_children)
 
-    makedirs(Path("mutants"), exist_ok=True)
-    with SpinnerTask("Generating mutants", debug=config().debug) as task:
-        copy_src_dir()
-        copy_also_copy_files()
-        setup_source_paths()
-        store_lines_covered_by_tests()
-        stats = create_mutants(max_children)
-
-    state().mutant_generation_time = task.elapsed_seconds
-    logger.info("Mutant generation completed in %.2f seconds", state().mutant_generation_time)
+    generate_mutants(max_children)
 
     if config().type_check_command:
         with SpinnerTask("Filtering mutations with type checker", debug=config().debug):
@@ -730,7 +736,7 @@ def find_top_level_function_or_method(module: cst.Module, name: str) -> cst.Func
 
 
 def read_original_function(module: cst.Module, mutant_name: str) -> cst.FunctionDef:
-    orig_function_name, _ = orig_function_and_class_names_from_key(mutant_name)
+    orig_function_name, _ = orig_function_and_class_names_from_mutant_name(mutant_name)
     orig_name = mangled_name_from_mutant_name(mutant_name) + "__mutmut_orig"
 
     result = find_top_level_function_or_method(module, orig_name)
@@ -740,7 +746,7 @@ def read_original_function(module: cst.Module, mutant_name: str) -> cst.Function
 
 
 def read_mutant_function(module: cst.Module, mutant_name: str) -> cst.FunctionDef:
-    orig_function_name, _ = orig_function_and_class_names_from_key(mutant_name)
+    orig_function_name, _ = orig_function_and_class_names_from_mutant_name(mutant_name)
 
     result = find_top_level_function_or_method(module, mutant_name)
     if not result:
@@ -875,7 +881,7 @@ def apply(mutant_name: str) -> None:
 def apply_mutant(mutant_name: str) -> None:
     path = find_mutant(mutant_name).path
 
-    orig_function_name, _ = orig_function_and_class_names_from_key(mutant_name)
+    orig_function_name, _ = orig_function_and_class_names_from_mutant_name(mutant_name)
     orig_function_name = orig_function_name.rpartition(".")[-1]
 
     orig_module = read_orig_module(path)
@@ -897,16 +903,30 @@ def apply_mutant(mutant_name: str) -> None:
 @cli.command()
 @click.option("--show-killed", is_flag=True, default=False, help="Display mutants killed by tests and type checker.")
 def browse(show_killed: bool) -> None:
-    from mutmut.ui.browse import run_result_browser
+    from mutmut.mutation.file_mutation import compute_current_function_hashes
+    from mutmut.ui.browser import run_result_browser
+
+    # Compute current function hashes from source files for cache status display
+    current_hashes: dict[str, str] = {}
+    for p in walk_source_files():
+        if config().should_ignore_for_mutation(p):
+            continue
+        try:
+            source_code = p.read_text()
+            file_hashes = compute_current_function_hashes(source_code)
+            current_hashes.update(file_hashes)
+        except (OSError, UnicodeDecodeError):
+            # Skip files that can't be read
+            continue
 
     run_result_browser(
         show_killed=show_killed,
         status_by_exit_code=status_by_exit_code,
         emoji_by_status=emoji_by_status,
-        walk_source_files=walk_source_files(),
-        collect_stat=collect_stat,
         get_diff_for_mutant=get_diff_for_mutant,
         apply_mutant=apply_mutant,
+        current_hashes=current_hashes,
+        function_dependencies=state().function_dependencies if config().track_dependencies else None,
     )
 
 

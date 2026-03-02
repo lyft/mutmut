@@ -149,6 +149,7 @@ def _load_config() -> Config:
         log_to_file=s("log_to_file", False),
         log_file_path=s("log_file_path", "mutants/mutmut-debug.log"),
         mutate_only_covered_lines=s("mutate_only_covered_lines", False),
+        mutate_enums=s("mutate_enums", True),
         paths_to_mutate=[Path(y) for y in s("paths_to_mutate", [])] or [Path(p) for p in _guess_paths_to_mutate()],
         tests_dir=s("tests_dir", []),
         pytest_add_cli_args=s("pytest_add_cli_args", []),
@@ -177,12 +178,21 @@ class Config:
     tests_dir: list[str]
     mutate_only_covered_lines: bool
     type_check_command: list[str]
+    mutate_enums: bool
     track_dependencies: bool
     dependency_tracking_depth: int | None
     process_isolation: ProcessIsolation  # Default: FORK (preserves current behavior)
     max_orchestrator_restarts: int  # Default: 3
     hot_fork_warmup: HotForkWarmup  # Default: COLLECT
     preload_modules_file: str | None  # Default: None (for IMPORT warmup)
+
+    def get_effective_dependency_depth(self) -> int:
+        """Get the effective dependency tracking depth, clamped to max_stack_depth."""
+        if self.dependency_tracking_depth is None:
+            return self.max_stack_depth
+        if self.max_stack_depth == -1:
+            return self.dependency_tracking_depth
+        return min(self.dependency_tracking_depth, self.max_stack_depth)
 
     def should_ignore_for_mutation(self, path: Path | str) -> bool:
         path_str = str(path)

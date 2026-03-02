@@ -7,18 +7,20 @@ def test_type_checking_result_snapshot():
     assert run_mutmut_on_project("type_checking") == snapshot(
         {
             "mutants/src/type_checking/__init__.py.meta": {
-                "type_checking.x_hello__mutmut_1": 37,
-                "type_checking.x_hello__mutmut_2": 1,
-                "type_checking.x_hello__mutmut_3": 1,
-                "type_checking.x_hello__mutmut_4": 1,
-                "type_checking.x_a_hello_wrapper__mutmut_1": 37,
-                "type_checking.x_a_hello_wrapper__mutmut_2": 0,
-                "type_checking.xǁPersonǁset_name__mutmut_1": 37,
-                "type_checking.x_mutate_me__mutmut_1": 37,
-                "type_checking.x_mutate_me__mutmut_2": 37,
-                "type_checking.x_mutate_me__mutmut_3": 37,
-                "type_checking.x_mutate_me__mutmut_4": 37,
-                "type_checking.x_mutate_me__mutmut_5": 37,
+                "exit_codes": {
+                    "type_checking.x_hello__mutmut_1": 37,
+                    "type_checking.x_hello__mutmut_2": 1,
+                    "type_checking.x_hello__mutmut_3": 1,
+                    "type_checking.x_hello__mutmut_4": 1,
+                    "type_checking.x_a_hello_wrapper__mutmut_1": 37,
+                    "type_checking.x_a_hello_wrapper__mutmut_2": 0,
+                    "type_checking.xǁPersonǁset_name__mutmut_1": 37,
+                    "type_checking.x_mutate_me__mutmut_1": 37,
+                    "type_checking.x_mutate_me__mutmut_2": 37,
+                    "type_checking.x_mutate_me__mutmut_3": 37,
+                    "type_checking.x_mutate_me__mutmut_4": 37,
+                    "type_checking.x_mutate_me__mutmut_5": 37,
+                }
             }
         }
     )

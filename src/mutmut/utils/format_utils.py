@@ -6,6 +6,11 @@ from pathlib import Path
 CLASS_NAME_SEPARATOR = "ǁ"
 
 
+def mangled_name_from_mutant_name(mutant_name: str) -> str:
+    assert "__mutmut_" in mutant_name, mutant_name
+    return mutant_name.partition("__mutmut_")[0]
+
+
 def mangle_function_name(*, name: str, class_name: str | None) -> str:
     assert CLASS_NAME_SEPARATOR not in name
     if class_name:
@@ -65,12 +70,7 @@ def get_module_from_key(key: str) -> str:
     return key.rsplit(".", 1)[0] if "." in key else key
 
 
-def mangled_name_from_mutant_name(mutant_name: str) -> str:
-    assert "__mutmut_" in mutant_name, mutant_name
-    return mutant_name.partition("__mutmut_")[0]
-
-
-def orig_function_and_class_names_from_key(mutant_name: str) -> tuple[str, str | None]:
+def orig_function_and_class_names_from_mutant_name(mutant_name: str) -> tuple[str, str | None]:
     r = mangled_name_from_mutant_name(mutant_name)
     _, _, r = r.rpartition(".")
     class_name = None
@@ -81,3 +81,23 @@ def orig_function_and_class_names_from_key(mutant_name: str) -> tuple[str, str |
         assert r.startswith("x_"), r
         r = r[2:]
     return r, class_name
+
+
+def raw_func_name_from_mangled(mangled: str) -> str:
+    """Convert a mangled name to its raw (canonical) form.
+
+    Converts 'module.x_funcname' to 'module.funcname' for dependency lookup.
+    Also handles class methods: 'module.xǁClassǁmethod' -> 'module.Class.method'
+
+    :param mangled: A mangled name like "module.x_foo" or "module.xǁClassǁmethod"
+    :return: The raw name like "module.foo" or "module.Class.method"
+    """
+    module_part, _, func_part = mangled.rpartition(".")
+    if CLASS_NAME_SEPARATOR in func_part:
+        # Handle class methods: xǁClassǁmethod -> Class.method
+        class_name = func_part[func_part.index(CLASS_NAME_SEPARATOR) + 1 : func_part.rindex(CLASS_NAME_SEPARATOR)]
+        method_name = func_part[func_part.rindex(CLASS_NAME_SEPARATOR) + 1 :]
+        func_part = f"{class_name}.{method_name}"
+    elif func_part.startswith("x_"):
+        func_part = func_part[2:]
+    return f"{module_part}.{func_part}" if module_part else func_part

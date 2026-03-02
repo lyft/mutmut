@@ -58,6 +58,7 @@ dev = [
     "pyrefly>=0.53.0",
     "pytest-asyncio>=1.0.0",
     "ruff>=0.15.1",
+    "gevent>=24.2.1",
 ]
 
 [tool.pytest.ini_options]

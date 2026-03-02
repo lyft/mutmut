@@ -193,7 +193,8 @@ class PytestRunner(TestRunner):
         """Execute pytest with the given parameters."""
         import pytest  # noqa: F401
 
-        params = ["--rootdir=.", "-q", "--tb=native"] + params + self._pytest_add_cli_args
+        # Use -c to force local config, preventing pytest from finding parent pyproject.toml
+        params = ["-c", "pyproject.toml", "--rootdir=.", "-q", "--tb=native"] + params + self._pytest_add_cli_args
         if config().debug:
             params = ["-vv"] + params
             print("python -m pytest ", " ".join([f'"{param}"' for param in params]))

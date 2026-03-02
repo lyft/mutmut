@@ -6,15 +6,16 @@ import libcst as cst
 import pytest
 from inline_snapshot import snapshot
 
-from mutmut.__main__ import MutmutProgrammaticFailException
 from mutmut.__main__ import get_diff_for_mutant
-from mutmut.__main__ import orig_function_and_class_names_from_key
 from mutmut.__main__ import run_forced_fail_test
+from mutmut.configuration import config
+from mutmut.core import MutmutProgrammaticFailException
 from mutmut.mutation.file_mutation import _create_mutations
 from mutmut.mutation.file_mutation import mutate_file_contents
 from mutmut.ui.terminal import CatchOutput
 from mutmut.utils.format_utils import CLASS_NAME_SEPARATOR
 from mutmut.utils.format_utils import mangle_function_name
+from mutmut.utils.format_utils import orig_function_and_class_names_from_mutant_name
 
 
 def mutants_for_source(source: str, covered_lines: set[int] | None = None) -> list[str]:
@@ -660,7 +661,8 @@ class Color(Enum):
     def describe(self):
         return self.name.lower()
 """.strip()
-    mutated_code, _, _, _ = mutate_file_contents(source, mutate_enums=False)
+    config().mutate_enums = False
+    mutated_code, _, _, _ = mutate_file_contents(source)
     # No mutation code should be added
     assert "__mutmut_mutants" not in mutated_code
     assert "_Color_describe_trampoline" not in mutated_code
@@ -933,11 +935,13 @@ def foo():
 
 
 def test_orig_function_name_from_key():
-    assert orig_function_and_class_names_from_key(f"_{CLASS_NAME_SEPARATOR}Foo{CLASS_NAME_SEPARATOR}bar__mutmut_1") == (
+    assert orig_function_and_class_names_from_mutant_name(
+        f"_{CLASS_NAME_SEPARATOR}Foo{CLASS_NAME_SEPARATOR}bar__mutmut_1"
+    ) == (
         "bar",
         "Foo",
     )
-    assert orig_function_and_class_names_from_key("x_bar__mutmut_1") == ("bar", None)
+    assert orig_function_and_class_names_from_mutant_name("x_bar__mutmut_1") == ("bar", None)
 
 
 def test_mangle_function_name():

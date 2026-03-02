@@ -120,7 +120,11 @@ class TestTimeoutCheckerThread:
 
             # All children should be terminated
             for pid in pids:
-                result_pid, _ = os.waitpid(pid, os.WNOHANG)
+                for _ in range(50):  # 50 * 0.1s = 5 seconds max
+                    result_pid, _ = os.waitpid(pid, os.WNOHANG)
+                    if result_pid == pid:
+                        break
+                    time.sleep(0.1)
                 assert result_pid == pid, f"Process {pid} should have been terminated"
         finally:
             for pid in pids:

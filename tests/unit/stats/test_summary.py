@@ -119,7 +119,7 @@ class TestWriteSummaryFile:
         """Mock the name-resolution helpers used inside write_summary_file."""
         with (
             patch("mutmut.stats.mangled_name_from_mutant_name", side_effect=lambda n: n.partition("__mutmut_")[0]),
-            patch("mutmut.stats.orig_function_and_class_names_from_key", side_effect=lambda n: ("func", None)),
+            patch("mutmut.stats.orig_function_and_class_names_from_mutant_name", side_effect=lambda n: ("func", None)),
         ):
             yield
 

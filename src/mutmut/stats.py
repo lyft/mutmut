@@ -9,6 +9,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 
+from mutmut.configuration import config
 from mutmut.models.source_file_mutation_data import SourceFileMutationData
 from mutmut.models.summary import NotCheckedMutant
 from mutmut.models.summary import NoTestsMutant
@@ -19,7 +20,7 @@ from mutmut.models.summary import SurvivingMutant
 from mutmut.state import state
 from mutmut.ui.terminal import print_status
 from mutmut.utils.format_utils import mangled_name_from_mutant_name
-from mutmut.utils.format_utils import orig_function_and_class_names_from_key
+from mutmut.utils.format_utils import orig_function_and_class_names_from_mutant_name
 
 status_by_exit_code = defaultdict(
     lambda: "suspicious",
@@ -183,6 +184,37 @@ def calculate_stats_by_mutation_type(
     return {mutation_type: dict(status_counts) for mutation_type, status_counts in stats_by_type.items()}
 
 
+def load_stats() -> bool:
+    did_load = False
+    try:
+        with open("mutants/mutmut-stats.json") as f:
+            data: dict[str, object] = json.load(f)
+            for k, v in data.pop("tests_by_mangled_function_name").items():  # type: ignore[attr-defined]
+                state().tests_by_mangled_function_name[k] |= set(v)
+            state().duration_by_test = data.pop("duration_by_test")  # type: ignore[assignment]
+            state().stats_time = data.pop("stats_time")  # type: ignore[assignment]
+            state().old_function_hashes = data.pop("function_hashes", {})  # type: ignore[assignment]
+
+            saved_dep_config: dict[str, object] = data.pop("dependency_tracking_config", {})  # type: ignore[assignment]
+            saved_dependencies: dict[str, list[str]] = data.pop("function_dependencies", {})  # type: ignore[assignment]
+            dep_config_changed = (
+                saved_dep_config.get("track_dependencies") != config().track_dependencies
+                or saved_dep_config.get("effective_depth") != config().get_effective_dependency_depth()
+            )
+
+            if dep_config_changed:
+                state().function_dependencies.clear()
+            else:
+                for k, v in saved_dependencies.items():
+                    state().function_dependencies[k] = set(v)
+
+            assert not data, data
+            did_load = True
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return did_load
+
+
 def save_stats() -> None:
     with open("mutants/mutmut-stats.json", "w") as f:
         json.dump(
@@ -194,6 +226,10 @@ def save_stats() -> None:
                 "stats_time": state().stats_time,
                 "function_hashes": state().current_function_hashes,
                 "function_dependencies": {k: list(v) for k, v in state().function_dependencies.items()},
+                "dependency_tracking_config": {
+                    "track_dependencies": config().track_dependencies,
+                    "effective_depth": config().get_effective_dependency_depth(),
+                },
             },
             f,
             indent=4,
@@ -226,7 +262,7 @@ def write_summary_file(
         path_posix = path.replace("\\", "/")
 
         for mutant_name, exit_code in m.exit_code_by_key.items():
-            func_name, _ = orig_function_and_class_names_from_key(mutant_name)
+            func_name, _ = orig_function_and_class_names_from_mutant_name(mutant_name)
             mangled_name = mangled_name_from_mutant_name(mutant_name)
             metadata = m.mutation_metadata_by_module_name.get(mutant_name)
             associated_tests = list(state().tests_by_mangled_function_name.get(mangled_name, []))
