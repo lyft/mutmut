@@ -7,11 +7,6 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 from typing import Any
 
-from mutmut.utils.file_utils import change_cwd
-from mutmut.utils.format_utils import mangled_name_from_mutant_name
-from mutmut.utils.format_utils import orig_function_and_class_names_from_key
-from mutmut.utils.format_utils import strip_prefix
-
 if platform.system() == "Windows":
     print(
         "To run mutmut on Windows, please use the WSL. Native windows support is tracked in issue https://github.com/boxed/mutmut/issues/397"
@@ -33,7 +28,6 @@ from collections import defaultdict
 from collections.abc import Callable
 from collections.abc import Sequence
 from dataclasses import dataclass
-from dataclasses import field
 from datetime import datetime
 from datetime import timedelta
 from difflib import unified_diff
@@ -59,16 +53,23 @@ from mutmut.code_coverage import gather_coverage
 from mutmut.code_coverage import get_covered_lines_for_file
 from mutmut.configuration import config
 from mutmut.core import MutmutProgrammaticFailException
-from mutmut.mutation.data import SourceFileMutationData
-from mutmut.mutation.file_mutation import MutationMetadata
+from mutmut.models.mutation import MutationMetadata
+from mutmut.models.results import FileMutationResult
+from mutmut.models.results import MutantGenerationStats
+from mutmut.models.source_file_mutation_data import SourceFileMutationData
 from mutmut.mutation.file_mutation import filter_mutants_with_type_checker
 from mutmut.mutation.file_mutation import mutate_file_contents
 from mutmut.state import state
 from mutmut.threading.timeout import register_timeout
+from mutmut.utils.file_utils import change_cwd
 from mutmut.utils.format_utils import get_module_from_key
+from mutmut.utils.format_utils import mangled_name_from_mutant_name
+from mutmut.utils.format_utils import orig_function_and_class_names_from_key
+from mutmut.utils.format_utils import strip_prefix
 from mutmut.utils.safe_setproctitle import safe_setproctitle as setproctitle
 
 # Document: surviving mutants are retested when you ask mutmut to retest them, interactively in the UI or via command line
+
 
 # TODO: pragma no mutate should end up in `skipped` category
 
@@ -183,25 +184,6 @@ def copy_src_dir() -> None:
             # This matters: create_mutants_for_file skips when source_mtime < mutant_mtime,
             # so a fresh copy (equal mtime) correctly triggers mutation on the first run.
             shutil.copy2(source_path, target_path)
-
-
-@dataclass
-class FileMutationResult:
-    """Dataclass to transfer warnings and errors from child processes to the parent"""
-
-    warnings: list[Warning] = field(default_factory=list)
-    error: Exception | None = None
-    unmodified: bool = False
-    ignored: bool = False
-    changed_functions: set[str] | None = None
-    current_hashes: dict[str, str] | None = None
-
-
-@dataclass
-class MutantGenerationStats:
-    mutated: int = 0
-    unmodified: int = 0
-    ignored: int = 0
 
 
 def create_mutants(max_children: int) -> MutantGenerationStats:
